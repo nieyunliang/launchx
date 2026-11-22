@@ -3,6 +3,8 @@ import CoreGraphics
 import Darwin
 import Foundation
 import OSLog
+import QuartzCore
+import os
 
 // MARK: - 原始触点手势识别（macOS 27.2 误分类问题的根治方案）
 //
@@ -84,9 +86,27 @@ enum PinchTouchThresholds {
     static let fullTrip: Float = 0.30
     /// 会话结束后允许新候选的冷却期（防止同批触点立刻重开会话）。
     static let sessionCooldown: TimeInterval = 0.25
+    /// 松手终值去尾窗口：ended 取「松手前该时长之前」最近的进度样本
+    /// （≈3 帧，覆盖逐指抬起造成的张开度回落）。
+    static let releaseTrim: TimeInterval = 0.024
+    /// 进度历史保留窗口（松手去尾取值用；后续速度估计共用同一缓冲）。
+    static let historyWindow: TimeInterval = 0.15
+    /// 失触宽限：会话成员短暂失触（帧内消失且无 breakTouch）不超过此值
+    /// 不结束会话（单指状态抖动一两帧不应让手势「断掉」）。
+    static let dropoutGrace: TimeInterval = 0.024
     /// 抑制窗口续期步长 = 会话结束尾部：最后一段会话帧之后仍继续吞帧的时长
     /// （覆盖系统侧终帧；会话存活期间由识别器逐帧续期）。
     static let suppressTail: TimeInterval = 0.10
+}
+
+// MARK: - 单调时钟
+
+/// 手势时序统一单调时钟（O8）：mach 绝对时间（开机起算），不受 NTP 校时或
+/// 手动改时间的跳变影响（系统时钟跳变会让吞帧窗口卡住或冷却期失效）。
+/// 识别器冷却、抑制器吞帧窗口、MT 回调时序共用；trace 日志仍用系统时钟
+/// （方便与系统日志对照）。
+enum GestureClock {
+    @inline(__always) static func now() -> TimeInterval { CACurrentMediaTime() }
 }
 
 // MARK: - MTTouch 结构（MultitouchSupport 96 字节布局，社区公认逆向结果，
@@ -120,8 +140,10 @@ struct MTTouch {
 
 // MARK: - 原始触点捏合识别器（纯状态机，可注入时间做确定性测试）
 
-@MainActor
-final class PinchTouchRecognizer {
+/// 识别器无 UI 依赖、在 MT 回调线程同步运行（O7）：主线程拥塞时滑动否决
+/// 不再滞后。线程约定：单实例内串行访问（MT 对同一设备的回调串行；测试在
+/// 主线程驱动），无内部同步——因此 @unchecked Sendable。
+final class PinchTouchRecognizer: @unchecked Sendable {
 
     private struct TrackedContact {
         var id: Int32
@@ -132,12 +154,26 @@ final class PinchTouchRecognizer {
         var state: Int32
     }
 
+    private struct ProgressSample {
+        let t: TimeInterval
+        let p: CGFloat
+    }
+
     private var contacts: [Int32: TrackedContact] = [:]
     private var sessionActive = false
     private var sessionEmitting = false
     private var baselineSpread: Float = 0
     private var lastProgress: CGFloat = 0
     private var cooldownUntil: TimeInterval = 0
+    // O1：会话内峰值 |spreadDelta|——过识别门后位移否决的判据分子
+    private var peakAbsDelta: Float = 0
+    // O2：会话成员固定；成员子集变化时把基线平移到 delta 连续的位置
+    private var members: Set<Int32> = []
+    private var activeKey: [Int32] = []       // 上一帧参与计算的成员 id（升序）
+    private var lastSpreadDelta: Float = 0
+    // O3：进度历史（松手终值去尾）与失触宽限起点
+    private var history: [ProgressSample] = []
+    private var belowSince: TimeInterval?
 
     /// 处理一帧触点采样。MT 帧只包含当前仍在传感器上的触点；消失的触点视为已离开。
     func ingest(_ samples: [TouchSample], now: TimeInterval) -> IngestOutcome {
@@ -177,16 +213,38 @@ final class PinchTouchRecognizer {
                 c.originY = c.y
                 contacts[c.id] = c
             }
+            // 成员固定为开启时刻的全部触点（O2）：会话中新落下的手指（第 5 指
+            // 落板）不参与张开度/位移计算，其起落不影响会话生死。activeKey 同步
+            // 初始化，否则首帧 advanceSession 会误触发一次基线平移吞掉首帧位移。
+            members = Set(touching.map(\.id))
+            activeKey = touching.sorted { $0.id < $1.id }.map(\.id)
+            lastSpreadDelta = 0
+            peakAbsDelta = 0
+            history = []
+            belowSince = nil
             baselineSpread = Self.spread(of: touching) ?? 0
             lastProgress = 0
         }
 
-        // 4. 会话收尾：接触数跌破候选下限 = 手指离板（用户松手意图）
-        if sessionActive, touching.count < PinchTouchThresholds.minContacts {
-            if sessionEmitting {
-                outcome.events.append(PinchGestureEvent(phase: .ended, signedProgress: lastProgress))
+        // 4. 会话收尾：按成员口径判定——成员中仍在触的数跌破候选下限才是松手
+        // 意图，四指会话里第 5 指的起落不改变会话生死（O2）。
+        if sessionActive {
+            let memberTouching = touching.filter { members.contains($0.id) }.count
+            if memberTouching < PinchTouchThresholds.minContacts {
+                // 明确抬指（breakTouch 及之后）立即结束；否则先给失触宽限（O3-B）：
+                // 单指状态抖动一两帧不应让手势「断掉」。宽限期内不投递、不否决
+                // （advanceSession 的成员守卫已保证），抑制窗口随 sessionActive 续期。
+                let explicitLift = samples.contains { members.contains($0.id) && $0.state >= 5 }
+                if explicitLift {
+                    endSession(now: now, into: &outcome)
+                } else if let since = belowSince, now - since >= PinchTouchThresholds.dropoutGrace {
+                    endSession(now: now, into: &outcome)
+                } else if belowSince == nil {
+                    belowSince = now
+                }
+            } else {
+                belowSince = nil
             }
-            closeSession(now: now)
         }
 
         outcome.sessionActive = sessionActive
@@ -195,24 +253,39 @@ final class PinchTouchRecognizer {
 
     /// 会话进行中的一帧。产生的手势事件与否决/确认标记写入 outcome。
     private func advanceSession(touching: [TrackedContact], now: TimeInterval, into outcome: inout IngestOutcome) {
-        // 接触数跌破候选下限：交给收尾逻辑按「松手」落位，不走否决
-        //（此时 spread 不可靠，且抬手滑移是正常现象，不应触发否决）。
-        guard touching.count >= PinchTouchThresholds.minContacts else { return }
+        // 只用「仍在触的会话成员」参与计算：会话中新落下的非成员触点不污染
+        // 张开度与位移口径（O2）。成员跌破候选下限：交给收尾逻辑按「松手/失触」
+        // 落位，不走否决（此时 spread 不可靠，且抬手滑移是正常现象）。
+        let active = touching.filter { members.contains($0.id) }.sorted { $0.id < $1.id }
+        guard active.count >= PinchTouchThresholds.minContacts else { return }
 
-        // 每指位移：当前接触者相对各自落点的最大位移
+        // 每指位移：当前接触成员相对各自落点的最大位移
         var maxFingerMove: Float = 0
-        for c in touching {
+        for c in active {
             let dx = c.x - c.originX
             let dy = c.y - c.originY
             maxFingerMove = max(maxFingerMove, (dx * dx + dy * dy).squareRoot())
         }
 
-        // 张开度变化：当前平均两两间距 - 会话起点间距
-        let currentSpread = Self.spread(of: touching)
-        let spreadDelta = (currentSpread ?? baselineSpread) - baselineSpread
+        // 张开度变化：当前成员平均两两间距 - 会话起点间距
+        guard let raw = Self.spread(of: active) else { return }
+        let key = active.map(\.id)
+        if key != activeKey {
+            // 成员子集变化（会话成员抬起，新落指不是成员不会走到这里）：把基线
+            // 平移到能让本帧 delta 与上一帧连续的位置，进度不跳变（O2）。
+            baselineSpread = raw - lastSpreadDelta
+            activeKey = key
+        }
+        let spreadDelta = raw - baselineSpread
+        lastSpreadDelta = spreadDelta
 
-        // 位移否决：手指大幅平移而跨度几乎不变 = 滑动（LaunchOS movementThreshold 同款）
-        let ratio = spreadDelta.magnitude / max(maxFingerMove, 0.0001)
+        // 位移否决：手指大幅平移而跨度几乎不变 = 滑动（LaunchOS movementThreshold 同款）。
+        // 过识别门前用当帧 |delta|——阈值按该口径实测标定（滑动 0.10~0.21），不动；
+        // 过门后改用会话内峰值 |delta|（O1）：不抬手反向过零、捏合后整手漂移时
+        // 当帧 delta 趋近 0，按当帧判定会把进行中的手势误判成滑动取消。
+        peakAbsDelta = max(peakAbsDelta, spreadDelta.magnitude)
+        let evidence = sessionEmitting ? peakAbsDelta : spreadDelta.magnitude
+        let ratio = evidence / max(maxFingerMove, 0.0001)
         if maxFingerMove > PinchTouchThresholds.movementFloor, ratio < PinchTouchThresholds.vetoRatio {
             outcome.vetoed = true
             if sessionEmitting {
@@ -235,6 +308,12 @@ final class PinchTouchRecognizer {
             // 张开 = 收起面板（负进度）。用户实测反馈「手势反了」即指此向。
             lastProgress = spreadDelta > 0 ? -CGFloat(progress) : CGFloat(progress)
             outcome.events.append(PinchGestureEvent(phase: .changed, signedProgress: lastProgress))
+            // 进度历史：松手终值去尾（O3-A）与后续速度估计共用，只保留最近窗口。
+            history.append(ProgressSample(t: now, p: lastProgress))
+            let cutoff = now - PinchTouchThresholds.historyWindow
+            while let first = history.first, first.t < cutoff {
+                history.removeFirst()
+            }
         }
     }
 
@@ -243,6 +322,46 @@ final class PinchTouchRecognizer {
         sessionEmitting = false
         lastProgress = 0
         cooldownUntil = now + PinchTouchThresholds.sessionCooldown
+        peakAbsDelta = 0
+        members = []
+        activeKey = []
+        lastSpreadDelta = 0
+        history = []
+        belowSince = nil
+    }
+
+    /// 会话正常收尾（松手 / 失触超宽限）：投递中则补 ended，终值按松手去尾。
+    private func endSession(now: TimeInterval, into outcome: inout IngestOutcome) {
+        if sessionEmitting {
+            outcome.events.append(PinchGestureEvent(phase: .ended, signedProgress: trimmedEndProgress(now: now)))
+        }
+        closeSession(now: now)
+    }
+
+    /// ended 终值：取松手前 releaseTrim 时刻之前最近的进度样本（O3-A 去尾）。
+    /// 松手是逐指抬起的，最后几帧接触面缩小、张开度往回掉，直接取末帧会让
+    /// 本来过半的捏合掉到提交线以下；不用峰值保持——用户最后时刻主动往回收
+    /// （想取消）时峰值会把取消误判成提交，去尾取值没有这个偏差。
+    /// 历史不足（样本全部落在去尾窗口内）时退回 lastProgress。
+    private func trimmedEndProgress(now: TimeInterval) -> CGFloat {
+        let cut = now - PinchTouchThresholds.releaseTrim
+        if let sample = history.last(where: { $0.t < cut }) {
+            return sample.p
+        }
+        return lastProgress
+    }
+
+    /// 外部中止（设备停止 / 重置）：投递中的会话补发 cancelled，供窗口层回退
+    /// 半途的跟手状态；无会话或未投递时返回空。
+    /// 时钟与 ingest 一致（GestureClock 单调时钟，O8）——否则冷却期按纪元秒
+    /// 写入、按开机秒比较，会话在设备重启后被永久卡死。
+    func abort(now: TimeInterval = GestureClock.now()) -> [PinchGestureEvent] {
+        guard sessionActive else { return [] }
+        let events: [PinchGestureEvent] = sessionEmitting
+            ? [PinchGestureEvent(phase: .cancelled, signedProgress: lastProgress)]
+            : []
+        closeSession(now: now)
+        return events
     }
 
     /// 接触点的平均两两间距（≥3 点才有意义）。
@@ -259,6 +378,51 @@ final class PinchTouchRecognizer {
             }
         }
         return pairs > 0 ? sum / Float(pairs) : nil
+    }
+}
+
+// MARK: - 识别 pipeline 与事件邮箱（识别器下沉 MT 线程，O7）
+
+/// 识别 pipeline：识别器 + 事件邮箱 + 空闲帧过滤状态。只在 MT 回调线程访问
+/// （MT 对同一设备的回调串行），每次 startDevice 新建——天然完成状态重置，
+/// 无需手工清理上一会话的残留。
+final class TouchPipeline: @unchecked Sendable {
+    let recognizer = PinchTouchRecognizer()
+    let mailbox = PinchEventMailbox()
+    /// 上次运行识别器的帧接触数（空闲帧过滤决策）。
+    var lastForwardedTouching = 0
+}
+
+/// MT 线程投递、主线程取走的事件邮箱。主线程积压时连续的 changed 合并为
+/// 最新一条——进度是绝对量（非增量），合并不损失信息；主线程不再对积压帧
+/// 逐帧重复写 pinchTransitionProgress 产生无效渲染。
+final class PinchEventMailbox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: [PinchGestureEvent] = []
+    private var drainScheduled = false
+
+    /// 返回 true 表示调用方需要调度一次主线程 drain。
+    func post(_ events: [PinchGestureEvent]) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        for event in events {
+            if event.phase == .changed, let last = pending.last, last.phase == .changed {
+                pending[pending.count - 1] = event
+            } else {
+                pending.append(event)
+            }
+        }
+        guard !pending.isEmpty, !drainScheduled else { return false }
+        drainScheduled = true
+        return true
+    }
+
+    func drain() -> [PinchGestureEvent] {
+        lock.lock()
+        defer { lock.unlock() }
+        drainScheduled = false
+        defer { pending.removeAll(keepingCapacity: true) }
+        return pending
     }
 }
 
@@ -280,7 +444,7 @@ final class GestureSuppressor: @unchecked Sendable {
 
     /// 捏合会话存活：识别器逐帧续期；会话终止后靠本时间戳自然过期出尾部窗口。
     /// 滑动闭锁期间为空操作（保证闭锁后同批触点不再重新吞帧）。
-    func arm(now: TimeInterval = Date().timeIntervalSince1970) {
+    func arm(now: TimeInterval = GestureClock.now()) {
         lock.lock()
         defer { lock.unlock() }
         armLocked(now: now)
@@ -301,7 +465,7 @@ final class GestureSuppressor: @unchecked Sendable {
     }
 
     /// 同批触点过识别门（确认真捏合）：推翻滑动闭锁，恢复压制。
-    func confirmPinch(now: TimeInterval = Date().timeIntervalSince1970) {
+    func confirmPinch(now: TimeInterval = GestureClock.now()) {
         lock.lock()
         defer { lock.unlock() }
         swipeLatched = false
@@ -312,7 +476,7 @@ final class GestureSuppressor: @unchecked Sendable {
     /// - ≥4 触点：临时武装抑制（抢在主线程会话开启前压制真捏合最早帧；
     ///   三指滑动只有 3 触点，永不触发）；
     /// - <3 触点：解除滑动闭锁（触点撤离）。
-    func note(touchingCount: Int, now: TimeInterval = Date().timeIntervalSince1970) {
+    func note(touchingCount: Int, now: TimeInterval = GestureClock.now()) {
         lock.lock()
         defer { lock.unlock() }
         if touchingCount >= PinchTouchThresholds.minContacts {
@@ -323,7 +487,7 @@ final class GestureSuppressor: @unchecked Sendable {
     }
 
     /// 是否处于吞帧窗口。
-    func isActive(now: TimeInterval = Date().timeIntervalSince1970) -> Bool {
+    func isActive(now: TimeInterval = GestureClock.now()) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         return !swipeLatched && now <= armedUntil
@@ -423,11 +587,12 @@ public final class TrackpadTouchMonitor {
 
     nonisolated private static let logger = Logger(subsystem: "dev.yunliang.launchx", category: "TouchMonitor")
 
-    /// MT 回调线程读取；startDevice 前设置、stopDevice 后置空（回调期间恒有效）。
+    /// MT 回调线程在主线程 drain 时读取；startDevice 前设置、stopDevice 后置空。
     nonisolated(unsafe) private static var activeMonitor: TrackpadTouchMonitor?
-    /// MT 回调线程读写的上次转发帧接触数（回调串行；仅供空闲帧过滤决策）。
-    nonisolated(unsafe) private static var lastForwardedTouching = 0
-    /// ≥3 触点抑制窗口（MT 线程写 / tap 回调读）。
+    /// 识别 pipeline（识别器 + 事件邮箱 + 空闲帧过滤状态）：MT 回调线程经锁取
+    /// 快照使用（O7 生命周期保护）；stopDevice 先 MTDeviceStop 再置空。
+    nonisolated private static let pipelineRef = OSAllocatedUnfairLock<TouchPipeline?>(initialState: nil)
+    /// 捏合会话驱动的抑制窗口（MT 线程写 / tap 回调读）。
     nonisolated static let suppressor = GestureSuppressor()
 
     /// 空闲帧过滤决策（纯函数，供测试）：转发 = 多触活动（≥2）或触点数下降
@@ -438,9 +603,14 @@ public final class TrackpadTouchMonitor {
         touching >= 2 || touching < lastTouching
     }
 
+    /// 测试驱动入口（ingestForTesting）专用识别器：与 MT pipeline 的识别器
+    /// 互不相干（MT 回调永不触碰它）。
     private let recognizer = PinchTouchRecognizer()
     private var device: UnsafeMutableRawPointer?
     private var axChangeObserver: (any NSObjectProtocol)?
+    /// 睡眠唤醒 / 会话切换观察者（O4）：MT 设备在系统睡眠、唤醒或切换用户后
+    /// 经常不再回调，手势入口静默失灵只能重启 App 恢复；唤醒后延迟重启设备。
+    private var wakeObservers: [any NSObjectProtocol] = []
 
     public private(set) var isEnabled: Bool = false
 
@@ -477,6 +647,10 @@ public final class TrackpadTouchMonitor {
         guard enabled != isEnabled else { return }
         isEnabled = enabled
         restart()
+        // 唤醒观察者只在关闭手势时移除（stop/restart 不移除，否则下次唤醒监听不到）
+        if !enabled {
+            removeWakeObservers()
+        }
     }
 
     public func restart() {
@@ -485,6 +659,7 @@ public final class TrackpadTouchMonitor {
         startDevice()
         startSuppressorTap()
         observePermissionChange()
+        observeSystemWake()
     }
 
     public func stop() {
@@ -495,6 +670,33 @@ public final class TrackpadTouchMonitor {
             DistributedNotificationCenter.default().removeObserver(observer)
             axChangeObserver = nil
         }
+    }
+
+    // MARK: 睡眠唤醒自愈（O4）
+
+    /// 唤醒后设备未必立即就绪：延迟 1s 再重启。观察者常驻（restart 幂等注册），
+    /// 仅 setEnabled(false) 时移除。
+    private func observeSystemWake() {
+        guard wakeObservers.isEmpty else { return }
+        let nc = NSWorkspace.shared.notificationCenter  // 必须用 NSWorkspace 的通知中心
+        for name in [NSWorkspace.didWakeNotification, NSWorkspace.sessionDidBecomeActiveNotification] {
+            wakeObservers.append(nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                        guard let self, self.isEnabled else { return }
+                        self.restart()
+                    }
+                }
+            })
+        }
+    }
+
+    private func removeWakeObservers() {
+        let nc = NSWorkspace.shared.notificationCenter
+        for observer in wakeObservers {
+            nc.removeObserver(observer)
+        }
+        wakeObservers = []
     }
 
     /// 是否已具备「辅助功能」权限（仅抑制系统双开需要，手势本体不需要）。
@@ -518,11 +720,14 @@ public final class TrackpadTouchMonitor {
             return
         }
         Self.activeMonitor = self
+        // 每次 startDevice 新建 pipeline：识别器/邮箱/空闲帧过滤状态天然重置。
+        Self.pipelineRef.withLock { $0 = TouchPipeline() }
         bridge.registerContactFrame(device, unsafeBitCast(Self.contactFrameCallback, to: UnsafeMutableRawPointer.self))
         let status = bridge.start(device, 0)
         if status != 0 {
             Self.logger.error("MTDeviceStart 失败 status=\(status)")
             Self.activeMonitor = nil
+            Self.pipelineRef.withLock { $0 = nil }
             return
         }
         self.device = device
@@ -532,32 +737,46 @@ public final class TrackpadTouchMonitor {
 
     private func stopDevice() {
         guard let bridge = MultitouchBridge.load(logger: Self.logger), let device else { return }
-        Self.activeMonitor = nil
-        Self.lastForwardedTouching = 0
+        // 先停设备（MTDeviceStop 返回后不再有新回调），再清引用；在途回调持有
+        // pipeline 快照强引用，不受置空影响（O7 生命周期保护）。
         if bridge.isRunning(device) {
             _ = bridge.stop(device)
         }
+        // 半途会话补发 cancelled（O4）：避免窗口层卡在跟手状态
+        // （pinchStartVisible 不为 nil）。MTDeviceStop 已停回调，主线程此刻
+        // 独占 pipeline，abort 与 MT 回调不会并发。
+        let pipeline = Self.pipelineRef.withLock { $0 }
+        if let pipeline {
+            for event in pipeline.recognizer.abort() {
+                onEvent?(event)
+            }
+        }
         bridge.release(device)
         self.device = nil
+        Self.activeMonitor = nil
+        Self.pipelineRef.withLock { $0 = nil }
         Self.trace("DEVICE-STOPPED")
     }
 
-    // MARK: MT 回调 → 主线程识别
+    // MARK: MT 回调 → MT 线程识别（O7）→ 邮箱合并投递主线程
 
     /// MT 接触帧回调（MT 内部线程；无上下文参数，经 static 转交）。
     /// MTTouch 是 Swift 声明的布局结构，无法出现在 @convention(c) 签名里，
     /// 因此以 UnsafeRawPointer 按偏移解读（布局经本机探针验证）。
     private static let contactFrameCallback: @convention(c) (UnsafeMutableRawPointer?, UnsafeRawPointer?, Int32, Double, Int32) -> Void = { _, touches, count, _, _ in
         guard let touches, count > 0 else { return }
-        // 第一遍只数接触数：单指空闲帧在此短路（不构建样本、不进主线程）
+        // 第一遍只数接触数：单指空闲帧在此短路（不构建样本、不跑识别器）
         var touching = 0
         for i in 0..<Int(count) {
             let state = touches.advanced(by: i * MemoryLayout<MTTouch>.stride).load(fromByteOffset: 20, as: Int32.self)
             if state == 3 || state == 4 { touching += 1 }
         }
         suppressor.note(touchingCount: touching)
-        let forward = shouldForwardMTFrame(touching: touching, lastTouching: lastForwardedTouching)
-        lastForwardedTouching = touching
+        // 锁内取一次快照后使用：stopDevice 先 MTDeviceStop 再置空引用，且
+        // pipeline 是 class——快照持有的强引用保证回调期间不会被释放。
+        guard let pipeline = pipelineRef.withLock({ $0 }) else { return }
+        let forward = shouldForwardMTFrame(touching: touching, lastTouching: pipeline.lastForwardedTouching)
+        pipeline.lastForwardedTouching = touching
         guard forward || traceEnabled else { return }
         var samples: [TouchSample] = []
         samples.reserveCapacity(Int(count))
@@ -576,34 +795,52 @@ public final class TrackpadTouchMonitor {
             trace("FRAME n=\(count) touching=\(touching) sup=\(sup) fwd=\(forward ? 1 : 0) \(summary)")
         }
         guard forward else { return }
-        DispatchQueue.main.async {
-            MainActor.assumeIsolated {
-                guard let monitor = TrackpadTouchMonitor.activeMonitor else { return }
-                monitor.ingest(samples)
+
+        // 识别器在 MT 回调线程同步运行：吞帧决策链（滑动否决 → 放行）不再等
+        // 主线程处理完这一帧——主线程拥塞（翻页动画、首次展开渲染、壁纸捕获
+        // 回调）时，积压窗口内的 type 30 帧不再被误吞，四指滑动切空间不迟钝。
+        // 事件经邮箱合并后异步投递：主线程积压时连续 changed 只保留最新一条
+        // （进度是绝对量，合并不损失信息），不逐帧重复写进度产生无效渲染。
+        let now = GestureClock.now()
+        let outcome = pipeline.recognizer.ingest(samples, now: now)
+        applySuppression(outcome, now: now)
+        if pipeline.mailbox.post(outcome.events) {
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let monitor = TrackpadTouchMonitor.activeMonitor else { return }
+                    for event in pipeline.mailbox.drain() {
+                        monitor.onEvent?(event)
+                    }
+                }
             }
         }
     }
 
-    /// 主线程：喂识别器，转发事件并驱动系统侧抑制窗口。
-    /// 抑制由识别器会话驱动：判定为滑动当帧闭锁放行（切窗口载荷帧不许吞），
-    /// 确认真捏合后恢复压制（压系统启动台），会话存活期间逐帧续期。
-    /// 返回本帧识别产出（测试直接驱动时用于断言）。
-    @discardableResult
-    func ingest(_ samples: [TouchSample], now: TimeInterval = Date().timeIntervalSince1970) -> IngestOutcome {
-        let outcome = recognizer.ingest(samples, now: now)
+    /// 抑制决策与 trace（识别器会话驱动，MT 回调线程与测试入口共用）：
+    /// 判定为滑动当帧闭锁放行（切窗口载荷帧不许吞），确认真捏合后恢复压制
+    /// （压系统启动台），会话存活期间逐帧续期。
+    nonisolated private static func applySuppression(_ outcome: IngestOutcome, now: TimeInterval) {
         if outcome.vetoed {
-            Self.suppressor.latchSwipe()
-            Self.trace("LATCH-SWIPE")
+            suppressor.latchSwipe()
+            trace("LATCH-SWIPE")
         } else if outcome.pinchConfirmed {
-            Self.suppressor.confirmPinch(now: now)
-            Self.trace("CONFIRM-PINCH")
+            suppressor.confirmPinch(now: now)
+            trace("CONFIRM-PINCH")
         }
         if outcome.sessionActive {
-            Self.suppressor.arm(now: now)
+            suppressor.arm(now: now)
         }
-        if Self.traceEnabled, !outcome.events.isEmpty {
-            Self.trace(outcome.events.map { "EV \($0.phase) p=\(String(format: "%.2f", $0.signedProgress))" }.joined(separator: " | "))
+        if traceEnabled, !outcome.events.isEmpty {
+            trace(outcome.events.map { "EV \($0.phase) p=\(String(format: "%.2f", $0.signedProgress))" }.joined(separator: " | "))
         }
+    }
+
+    /// 测试直接驱动的同步入口（主线程调用）：与 MT 回调执行完全相同的识别 +
+    /// 抑制路径，事件直接交给 onEvent（不经邮箱合并与线程跳转，便于断言）。
+    @discardableResult
+    func ingestForTesting(_ samples: [TouchSample], now: TimeInterval) -> IngestOutcome {
+        let outcome = recognizer.ingest(samples, now: now)
+        Self.applySuppression(outcome, now: now)
         for event in outcome.events {
             onEvent?(event)
         }

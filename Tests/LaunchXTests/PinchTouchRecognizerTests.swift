@@ -5,7 +5,8 @@ import Testing
 // MARK: - 原始触点捏合识别器（合成触点帧回归）
 //
 // 阈值口径见 PinchTouchThresholds：minContacts=4、movementFloor=0.06、
-// vetoRatio=0.40、emitFloor=0.05、fullTrip=0.30、sessionCooldown=0.25s。
+// vetoRatio=0.40、emitFloor=0.05、fullTrip=0.30、sessionCooldown=0.25s、
+// releaseTrim=24ms（松手终值去尾）、dropoutGrace=24ms（失触宽限）。
 // 场景几何按 2026-11-21 真机带标签实测构造：滑动 ratio 0.10~0.21、
 // 捏合 ratio 0.59~1.52，判别式 spreadDelta / maxFingerMove。
 
@@ -19,8 +20,9 @@ struct PinchTouchRecognizerTests {
     }
 
     /// 十字四指位：围绕中心按系数 k 缩放（k=1 基准跨度、k>1 张开、k<1 捏拢）。
-    private func crossFrame(ids: [Int32], k: Float, center: (Float, Float) = (0.5, 0.5), state: Int32 = 4) -> [TouchSample] {
-        let offsets: [(Float, Float)] = [(-0.06, 0), (0.06, 0), (0, -0.06), (0, 0.06)]
+    /// `span` 为 k=1 时的半跨度；深捏合用例用 0.12（默认 0.06 捏到底不够行程）。
+    private func crossFrame(ids: [Int32], k: Float, center: (Float, Float) = (0.5, 0.5), state: Int32 = 4, span: Float = 0.06) -> [TouchSample] {
+        let offsets: [(Float, Float)] = [(-span, 0), (span, 0), (0, -span), (0, span)]
         return ids.enumerated().map { i, id in
             let (dx, dy) = offsets[i]
             return touch(id, state, center.0 + dx * k, center.1 + dy * k)
@@ -284,6 +286,8 @@ struct PinchTouchRecognizerTests {
     }
 
     /// 投递中转为平移（跨度冻结、位移猛增）→ cancelled，供窗口层回退。
+    /// O1 语义保留：峰值判据只豁免「反向过零 / 漂移」，真正的滑动仍要取消
+    /// （峰值 0.116 → 平移约 0.29 后比值跌破 0.40，依旧 cancelled）。
     @Test func translationMidSessionDeliversCancelled() {
         let recognizer = PinchTouchRecognizer()
         let ids: [Int32] = [1, 2, 3, 4]
@@ -306,6 +310,236 @@ struct PinchTouchRecognizerTests {
             Issue.record("末事件应为 cancelled：\(events)")
             return
         }
+    }
+
+    // MARK: P0 优化回归（docs/pinch-gesture-optimization.md）
+    //
+    // O1：过识别门后位移否决改用会话内峰值 |delta|。原测试的十字位合成几何
+    // 过零时每指恰好回到落点（maxFingerMove ≈ 0），掩盖了「中途反向 / 捏合后
+    // 漂移被误取消」；以下用例加入持续质心漂移构造真实几何。
+
+    /// 不抬手反向 + 全程质心漂移：旧逻辑在过零附近（当帧 |delta|≈0、位移已超
+    /// floor）误判成滑动取消；峰值判据下应完整投递到 ended。
+    @Test func reversalWithDriftIsNotVetoed() {
+        let recognizer = PinchTouchRecognizer()
+        let ids: [Int32] = [1, 2, 3, 4]
+        var frames: [[TouchSample]] = []
+        var drift: Float = 0
+        // 捏拢 1.0 → 0.5（0.05/帧，偏移 0.12 的大跨度），质心每帧 +0.004
+        for i in 0...10 {
+            let k = Float(1.0) - Float(i) * 0.05
+            frames.append(crossFrame(ids: ids, k: k, center: (0.5 + drift, 0.5),
+                                     state: i == 0 ? 3 : 4, span: 0.12))
+            drift += 0.004
+        }
+        // 不抬手反向：张开 0.5 → 1.4（0.05/帧），漂移继续累积
+        for j in 1...18 {
+            let k = Float(0.5) + Float(j) * 0.05
+            frames.append(crossFrame(ids: ids, k: k, center: (0.5 + drift, 0.5), span: 0.12))
+            drift += 0.004
+        }
+        frames.append(crossFrame(ids: ids, k: 1.4, center: (0.5 + drift, 0.5), state: 5, span: 0.12))
+        frames.append([])
+
+        let events = run(recognizer, frames: frames)
+        #expect(events.contains { $0.phase == .began }, "应过识别门开始投递")
+        #expect(!events.contains { $0.phase == .cancelled },
+                "反向过零 + 质心漂移不得被位移否决取消（旧逻辑在此误判滑动）")
+        #expect(events.last?.phase == .ended)
+    }
+
+    // MARK: O2：会话成员固定 + 成员变化时平移基线
+
+    /// 四指捏合中途第 5 指在远角落下并保持：成员固定后不参与张开度计算，
+    /// 进度连续不跳变；旧逻辑把它计入平均两两间距，进度跳变 > 0.1。
+    @Test func fifthFingerLandingKeepsContinuity() {
+        let recognizer = PinchTouchRecognizer()
+        let ids: [Int32] = [1, 2, 3, 4]
+        var frames: [[TouchSample]] = [crossFrame(ids: ids, k: 1.0, state: 3, span: 0.12)]
+        for i in 1...10 {
+            frames.append(crossFrame(ids: ids, k: Float(1.0) - Float(i) * 0.05, span: 0.12))
+        }
+        // 第 5 指在远角落下并保持
+        frames.append(crossFrame(ids: ids, k: 0.5, span: 0.12) + [touch(5, 3, 0.9, 0.9)])
+        for i in 1...5 {
+            frames.append(crossFrame(ids: ids, k: Float(0.5) - Float(i) * 0.04, span: 0.12)
+                + [touch(5, 4, 0.9, 0.9)])
+        }
+        frames.append(crossFrame(ids: ids, k: 0.3, state: 5, span: 0.12) + [touch(5, 5, 0.9, 0.9)])
+        frames.append([])
+
+        let events = run(recognizer, frames: frames)
+        #expect(!events.contains { $0.phase == .cancelled }, "第 5 指起落不得影响会话")
+        let changed = events.filter { $0.phase == .changed }.map(\.signedProgress)
+        #expect(!changed.isEmpty)
+        for (a, b) in zip(changed, changed.dropFirst()) {
+            #expect(abs(b - a) < 0.1, "第 5 指落下不得造成进度跳变（\(a) → \(b)）")
+        }
+    }
+
+    /// 五指会话中途一指（成员）抬起，剩余四指继续捏合：会话不结束，基线平移
+    /// 使 delta 连续；旧逻辑把该指从平均间距中剔除，进度跳变 > 0.1。
+    @Test func memberLiftInFiveFingerSessionRebases() {
+        let recognizer = PinchTouchRecognizer()
+        func fiveFrame(k: Float, state: Int32, withFifth: Bool) -> [TouchSample] {
+            var samples = crossFrame(ids: [1, 2, 3, 4], k: k, state: state, span: 0.12)
+            if withFifth {
+                samples.append(touch(5, state, 0.5 + 0.01 * k, 0.5 + 0.01 * k))
+            }
+            return samples
+        }
+        var frames: [[TouchSample]] = [fiveFrame(k: 1.0, state: 3, withFifth: true)]
+        for i in 1...5 {
+            frames.append(fiveFrame(k: Float(1.0) + Float(i) * 0.1, state: 4, withFifth: true))
+        }
+        // 成员第五指 state 5 一帧后消失；剩余四指继续张开
+        frames.append(fiveFrame(k: 1.6, state: 4, withFifth: true).map { t in
+            t.id == 5 ? TouchSample(id: 5, state: 5, x: t.x, y: t.y) : t
+        })
+        for i in 1...5 {
+            frames.append(fiveFrame(k: Float(1.6) + Float(i) * 0.08, state: 4, withFifth: false))
+        }
+        frames.append(fiveFrame(k: 2.0, state: 5, withFifth: false))
+        frames.append([])
+
+        let events = run(recognizer, frames: frames)
+        #expect(events.filter { $0.phase == .ended }.count == 1, "成员抬起（仍剩 4 指在触）不得结束会话")
+        #expect(!events.contains { $0.phase == .cancelled })
+        let changed = events.filter { $0.phase == .changed }.map(\.signedProgress)
+        #expect(!changed.isEmpty)
+        for (a, b) in zip(changed, changed.dropFirst()) {
+            #expect(abs(b - a) < 0.1, "成员抬起后基线应平移保持进度连续（\(a) → \(b)）")
+        }
+    }
+
+    // MARK: O3：松手终值去尾 + 失触宽限
+
+    /// 松手前最后 3 帧张开度回落（逐指抬起滑移）：ended 终值取松手前 24ms
+    /// 之前的进度，不被回落值拖下提交线；旧逻辑直接取 lastProgress（≈0.54）。
+    @Test func endedProgressTrimsLiftSlip() {
+        let recognizer = PinchTouchRecognizer()
+        let ids: [Int32] = [1, 2, 3, 4]
+        var frames: [[TouchSample]] = [crossFrame(ids: ids, k: 3.0, state: 3)]
+        for i in 1...20 {
+            frames.append(crossFrame(ids: ids, k: Float(3.0) - Float(i) * 0.1))
+        }
+        // 抬指滑移：3 帧回落（k 1.11/1.22/1.33 → 进度 0.61/0.57/0.54）后离板
+        for k in [Float(1.11), Float(1.22), Float(1.33)] {
+            frames.append(crossFrame(ids: ids, k: k))
+        }
+        frames.append(crossFrame(ids: ids, k: 1.33, state: 5))
+        frames.append([])
+
+        let events = run(recognizer, frames: frames)
+        guard let last = events.last, last.phase == .ended else {
+            Issue.record("末事件应为 ended：\(events)")
+            return
+        }
+        // 捏合终点 k=1.0 的进度 ≈ 0.64，终值不得被滑移段拖到提交线以下
+        #expect(last.signedProgress > 0.55,
+                "ended 终值应取滑移前进度（实际 \(last.signedProgress)）")
+    }
+
+    /// 成员短暂失触（帧内消失、无 breakTouch）2 帧（16ms）内恢复：宽限期内
+    /// 不结束会话，恢复后继续投递；旧逻辑当即 ended + 冷却，手势「断掉」。
+    @Test func briefDropoutWithinGraceContinues() {
+        let recognizer = PinchTouchRecognizer()
+        let ids: [Int32] = [1, 2, 3, 4]
+        var events: [PinchGestureEvent] = []
+        var now: TimeInterval = 1000
+        let step: TimeInterval = 0.008
+
+        func feed(_ frame: [TouchSample]) {
+            events.append(contentsOf: recognizer.ingest(frame, now: now).events)
+            now += step
+        }
+
+        // 捏拢过识别门（k 3.0 → 2.4）
+        feed(crossFrame(ids: ids, k: 3.0, state: 3))
+        for i in 1...6 {
+            feed(crossFrame(ids: ids, k: Float(3.0) - Float(i) * 0.1))
+        }
+        #expect(events.contains { $0.phase == .began })
+
+        // id=4 失触 2 帧（16ms）：宽限期内不得 ended，也不得否决
+        feed([touch(1, 4, 0.36, 0.5), touch(2, 4, 0.64, 0.5), touch(3, 4, 0.5, 0.36)])
+        feed([touch(1, 4, 0.35, 0.5), touch(2, 4, 0.65, 0.5), touch(3, 4, 0.5, 0.35)])
+        #expect(!events.contains { $0.phase == .ended }, "失触宽限期内不得结束会话")
+        #expect(!events.contains { $0.phase == .cancelled })
+
+        // 恢复后继续捏拢并松手：changed 续传，ended 恰好一次（松手）
+        for i in 1...5 {
+            feed(crossFrame(ids: ids, k: Float(2.0) - Float(i) * 0.15))
+        }
+        #expect(events.contains { $0.phase == .changed }, "恢复后应继续投递 changed")
+        feed(crossFrame(ids: ids, k: 1.25, state: 5))
+        feed([])
+        #expect(events.filter { $0.phase == .ended }.count == 1, "整个过程中 ended 应恰好一次")
+    }
+
+    /// 失触超过宽限期（24ms）→ 按松手收尾（ended）；宽限期内不得提前结束。
+    @Test func dropoutBeyondGraceEnds() {
+        let recognizer = PinchTouchRecognizer()
+        let ids: [Int32] = [1, 2, 3, 4]
+        var now: TimeInterval = 1000
+        let step: TimeInterval = 0.008
+
+        _ = recognizer.ingest(crossFrame(ids: ids, k: 3.0, state: 3), now: now)
+        now += step
+        for i in 1...6 {
+            _ = recognizer.ingest(crossFrame(ids: ids, k: Float(3.0) - Float(i) * 0.1), now: now)
+            now += step
+        }
+
+        // id=4 失触：宽限期内不 ended，超期后 ended
+        var endedAtFrame: Int?
+        for i in 0..<6 {
+            let outcome = recognizer.ingest(
+                [touch(1, 4, 0.36 - Float(i) * 0.005, 0.5), touch(2, 4, 0.64 + Float(i) * 0.005, 0.5),
+                 touch(3, 4, 0.5, 0.36 - Float(i) * 0.005)],
+                now: now)
+            if outcome.events.contains(where: { $0.phase == .ended }) {
+                endedAtFrame = i
+                break
+            }
+            now += step
+        }
+        #expect(endedAtFrame != nil, "失触超过宽限期后应 ended")
+        #expect(endedAtFrame == nil || endedAtFrame! >= 3, "宽限期内（前 3 帧 ≈24ms）不得提前 ended")
+    }
+
+    // MARK: O4：abort（设备停止时半途会话的回退出口）
+
+    /// 投递中 abort 补发 cancelled 供窗口层回退；无会话 / 未投递返回空；
+    /// abort 后冷却期内不重开候选。
+    @Test func abortDeliversCancelledWhenEmitting() {
+        let ids: [Int32] = [1, 2, 3, 4]
+
+        // 无会话：空
+        #expect(PinchTouchRecognizer().abort(now: 1000).isEmpty)
+
+        // 会话开启但未过识别门：空（会话仍被关闭）
+        let idle = PinchTouchRecognizer()
+        _ = idle.ingest(crossFrame(ids: ids, k: 1.0, state: 3, span: 0.12), now: 1000)
+        #expect(idle.abort(now: 1000.004).isEmpty)
+
+        // 投递中：[cancelled]，且 abort 后冷却期内不重开候选
+        let emitting = PinchTouchRecognizer()
+        var now: TimeInterval = 1000
+        var events: [PinchGestureEvent] = []
+        events.append(contentsOf: emitting.ingest(crossFrame(ids: ids, k: 1.0, state: 3, span: 0.12), now: now).events)
+        now += 0.008
+        for i in 1...6 {
+            let k = Float(1.0) - Float(i) * 0.05
+            events.append(contentsOf: emitting.ingest(crossFrame(ids: ids, k: k, span: 0.12), now: now).events)
+            now += 0.008
+        }
+        #expect(events.contains { $0.phase == .changed }, "应处于投递中")
+        let aborted = emitting.abort(now: now)
+        #expect(aborted.map(\.phase) == [.cancelled], "投递中 abort 应补发 cancelled：\(aborted)")
+
+        let after = emitting.ingest(crossFrame(ids: ids, k: 0.7, span: 0.12), now: now + 0.008)
+        #expect(after.events.isEmpty && !after.sessionActive, "abort 后冷却期内不得重开候选")
     }
 
     // MARK: 系统侧吞帧抑制（识别器会话驱动）
@@ -331,7 +565,7 @@ struct PinchTouchRecognizerTests {
 
         var now: TimeInterval = 1000
         for frame in frames {
-            monitor.ingest(frame, now: now)
+            monitor.ingestForTesting(frame, now: now)
             #expect(!TrackpadTouchMonitor.suppressor.isActive(now: now),
                     "三指滑动期间抑制必须全程关闭（t=\(now)）")
             now += 0.008
@@ -349,14 +583,14 @@ struct PinchTouchRecognizerTests {
         // 3 指落板阶段（未达候选数）：抑制不激活。
         // 触点 id 与后续捏合批共享：会话开启时落点原点重置，前置批次的紧缩位
         // 不会污染本批位移否决。
-        monitor.ingest([touch(1, 3, 0.44, 0.5), touch(2, 3, 0.56, 0.5), touch(3, 3, 0.5, 0.44)], now: now)
+        monitor.ingestForTesting([touch(1, 3, 0.44, 0.5), touch(2, 3, 0.56, 0.5), touch(3, 3, 0.5, 0.44)], now: now)
         #expect(!TrackpadTouchMonitor.suppressor.isActive(now: now))
         now += step
 
         // 4 指捏拢（k 3.0 → 1.0，含落板帧）：会话存活全程激活
         var lastContactFrameAt = now
         for k in stride(from: Float(3.0), through: Float(1.0), by: -0.1) {
-            monitor.ingest(crossFrame(ids: ids, k: k, state: k == 3.0 ? 3 : 4), now: now)
+            monitor.ingestForTesting(crossFrame(ids: ids, k: k, state: k == 3.0 ? 3 : 4), now: now)
             #expect(TrackpadTouchMonitor.suppressor.isActive(now: now),
                     "捏合会话存活期间抑制必须激活（k=\(k)）")
             lastContactFrameAt = now
@@ -364,8 +598,8 @@ struct PinchTouchRecognizerTests {
         }
 
         // 抬手（离板帧 + 空帧）：尾部窗口内仍激活
-        monitor.ingest(crossFrame(ids: ids, k: 1.0, state: 5), now: now)
-        monitor.ingest([], now: now + step)
+        monitor.ingestForTesting(crossFrame(ids: ids, k: 1.0, state: 5), now: now)
+        monitor.ingestForTesting([], now: now + step)
         #expect(TrackpadTouchMonitor.suppressor.isActive(now: lastContactFrameAt + 0.05),
                 "会话结束后 0.05s 应处于尾部抑制窗口")
         #expect(!TrackpadTouchMonitor.suppressor.isActive(now: lastContactFrameAt + 0.15),
@@ -394,7 +628,7 @@ struct PinchTouchRecognizerTests {
         var vetoed = false
         var activeBeforeVeto = 0
         for frame in frames {
-            let outcome = monitor.ingest(frame, now: now)
+            let outcome = monitor.ingestForTesting(frame, now: now)
             let active = TrackpadTouchMonitor.suppressor.isActive(now: now)
             if outcome.vetoed {
                 vetoed = true
@@ -413,7 +647,7 @@ struct PinchTouchRecognizerTests {
         TrackpadTouchMonitor.suppressor.note(touchingCount: 0)
         now += 0.3
         for k in stride(from: Float(3.0), through: Float(1.6), by: -0.1) {
-            monitor.ingest(crossFrame(ids: [1, 2, 3, 4], k: k), now: now)
+            monitor.ingestForTesting(crossFrame(ids: [1, 2, 3, 4], k: k), now: now)
             #expect(TrackpadTouchMonitor.suppressor.isActive(now: now),
                     "闭锁解除后的新捏合会话必须恢复抑制（k=\(k)）")
             now += 0.008
@@ -508,7 +742,7 @@ struct PinchTouchRecognizerTests {
         #expect(suppressor.isActive())
     }
 
-    /// 空闲帧过滤决策：仅多触活动（≥2）或触点数下降帧转发主线程。
+    /// 空闲帧过滤决策：仅多触活动（≥2）或触点数下降帧运行识别器。
     @Test func idleSingleTouchFramesAreFiltered() {
         // 单指空闲（光标移动/单指滚动）与无触帧：跳过
         #expect(!TrackpadTouchMonitor.shouldForwardMTFrame(touching: 1, lastTouching: 1))
@@ -520,5 +754,58 @@ struct PinchTouchRecognizerTests {
         // 触点数下降（离板/会话收尾）：转发
         #expect(TrackpadTouchMonitor.shouldForwardMTFrame(touching: 1, lastTouching: 2))
         #expect(TrackpadTouchMonitor.shouldForwardMTFrame(touching: 0, lastTouching: 4))
+    }
+
+    // MARK: PinchEventMailbox（O7：MT 线程投递、主线程合并取走）
+
+    /// 连续 changed 合并为最新一条（进度是绝对量）；began/ended/cancelled 不合并、
+    /// 保持顺序；已调度 drain 期间不重复调度（post 返回 false，事件仍入队）。
+    @Test func mailboxMergesConsecutiveChangedKeepsTerminalOrder() {
+        let mailbox = PinchEventMailbox()
+        #expect(mailbox.post([PinchGestureEvent(phase: .began, signedProgress: 0)]),
+                "首次 post 调度 drain")
+        // 已调度 drain：后续 post 返回 false（不重复调度），事件仍入队
+        #expect(!mailbox.post([PinchGestureEvent(phase: .changed, signedProgress: 0.1)]))
+        #expect(!mailbox.post([PinchGestureEvent(phase: .changed, signedProgress: 0.2)]))
+        #expect(!mailbox.post([PinchGestureEvent(phase: .changed, signedProgress: 0.3),
+                               PinchGestureEvent(phase: .ended, signedProgress: 0.5)]))
+
+        let drained = mailbox.drain()
+        #expect(drained.map(\.phase) == [.began, .changed, .ended])
+        #expect(drained[1].signedProgress == 0.3, "连续 changed 只保留最新一条")
+        #expect(drained[2].signedProgress == 0.5)
+
+        // drain 后清空；新事件重新可调度
+        #expect(mailbox.drain().isEmpty)
+        #expect(mailbox.post([PinchGestureEvent(phase: .cancelled, signedProgress: 0)]))
+        #expect(mailbox.drain().map(\.phase) == [.cancelled])
+    }
+
+    /// 同批多事件 post：began 与连续 changed 合并后仍保序，终态事件不丢。
+    @Test func mailboxBatchPostMergesWithinBatch() {
+        let mailbox = PinchEventMailbox()
+        let posted = mailbox.post([
+            PinchGestureEvent(phase: .began, signedProgress: 0),
+            PinchGestureEvent(phase: .changed, signedProgress: 0.1),
+            PinchGestureEvent(phase: .changed, signedProgress: 0.2),
+            PinchGestureEvent(phase: .ended, signedProgress: 0.2),
+        ])
+        #expect(posted)
+        let drained = mailbox.drain()
+        #expect(drained.map(\.phase) == [.began, .changed, .ended])
+        #expect(drained[1].signedProgress == 0.2)
+    }
+
+    /// 空 post 不调度 drain；drain 后再 post 重新调度（不丢已积压事件）。
+    @Test func mailboxEmptyPostAndRepostAfterDrain() {
+        let mailbox = PinchEventMailbox()
+        #expect(!mailbox.post([]), "空事件不调度")
+        _ = mailbox.post([PinchGestureEvent(phase: .changed, signedProgress: 0.1)])
+        // 主线程尚未 drain 时继续投递，再 drain：积压合并取走
+        #expect(!mailbox.post([PinchGestureEvent(phase: .changed, signedProgress: 0.4)]))
+        let drained = mailbox.drain()
+        #expect(drained.map(\.signedProgress) == [0.4])
+        // drain 后再 post 重新返回 true（调度窗口已重置）
+        #expect(mailbox.post([PinchGestureEvent(phase: .changed, signedProgress: 0.6)]))
     }
 }

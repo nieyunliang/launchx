@@ -1,7 +1,18 @@
 import AppKit
+import Observation
 import SwiftUI
 import Testing
 @testable import LaunchXCore
+
+/// Observation onChange（@Sendable）与测试主线程之间传递布尔标志的加锁盒。
+private final class FlagBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    var flag: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return value }
+        set { lock.lock(); defer { lock.unlock() }; value = newValue }
+    }
+}
 
 // MARK: - 根视图挂载冒烟（防环境缺失崩溃回归）
 
@@ -121,6 +132,72 @@ struct RootViewHostingTests {
 
         #expect(window.contentView === hosting)
         window.orderOut(nil)
+    }
+
+    /// O9 结构验证：根 body 的 Observation 依赖不得包含逐帧跟手进度。
+    /// 直接求值一次 body 登记依赖，随后改 `pinchTransitionProgress` 不应触发
+    /// 根 body 重算（回归：读逐帧进度会把根 body 登记为依赖，跟手期间每帧
+    /// 重算整棵树）；改 `isPinchInteracting`（会话门，只在起止翻转）应触发。
+    /// 每帧重算范围应限定在 `PanelTransitionContainer`。
+    @Test func rootBodyDoesNotTrackFrameProgress() {
+        // body 求值会经 LXColors.isDark 读 NSApp.effectiveAppearance：
+        // 单测过滤运行时 NSApp 可能尚未创建，显式初始化。
+        _ = NSApplication.shared
+        let dir = tempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = LayoutStore(directory: dir)
+        let model = LaunchpadModel(store: store)
+        let view = LaunchpadContentView(
+            model: model,
+            wallpaper: LaunchpadWallpaperStore(),
+            gridFocus: GridKeyboardFocus()
+        )
+
+        // onChange 是 @Sendable 闭包：标志经加锁盒传递
+        let rootReevaluated = FlagBox()
+        _ = withObservationTracking {
+            _ = view.body
+        } onChange: {
+            rootReevaluated.flag = true
+        }
+
+        // 对照 1：isVisible 是根 body 的合法依赖（确认登记机制本身工作）
+        model.isVisible = true
+        spinRunLoop(0.1)
+        #expect(rootReevaluated.flag, "对照：isVisible 是根 body 的合法依赖（登记机制工作）")
+
+        // 逐帧跟手进度：根 body 不得重算（重新登记——上一次注册已耗尽）
+        rootReevaluated.flag = false
+        _ = withObservationTracking {
+            _ = view.body
+        } onChange: {
+            rootReevaluated.flag = true
+        }
+        model.pinchTransitionProgress = 0.42
+        spinRunLoop(0.1)
+        #expect(!rootReevaluated.flag, "根 body 不得依赖逐帧跟手进度（O9）")
+
+        // 对照 2：会话门翻转应触发根 body 重算（命中测试门就在根上）
+        model.isPinchInteracting = true
+        spinRunLoop(0.1)
+        #expect(rootReevaluated.flag, "对照：isPinchInteracting 是根 body 的合法依赖")
+
+        // 容器：逐帧进度的每帧重算范围应限定在过渡容器 body
+        let container = PanelTransitionContainer(
+            model: model,
+            reduceMotion: false,
+            background: { Color.red },
+            content: { Text("probe") }
+        )
+        let containerReevaluated = FlagBox()
+        _ = withObservationTracking {
+            _ = container.body
+        } onChange: {
+            containerReevaluated.flag = true
+        }
+        model.pinchTransitionProgress = 0.5
+        spinRunLoop(0.1)
+        #expect(containerReevaluated.flag, "容器 body 应依赖逐帧进度（每帧重算范围 = 容器）")
     }
 }
 

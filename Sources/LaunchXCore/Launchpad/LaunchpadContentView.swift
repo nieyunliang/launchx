@@ -121,28 +121,20 @@ public struct LaunchpadContentView: View {
         self.gridFocus = gridFocus
     }
 
-    /// 手势期间逐帧取实时进度；其他入口仍由可见性驱动完整弹簧动画。
-    private var transitionProgress: Double {
-        model.pinchTransitionProgress ?? (model.isVisible ? 1 : 0)
-    }
-
     public var body: some View {
-        ZStack {
-            // 背景只做透明度合成；缩放仅作用于启动台内容。避免把全屏壁纸 /
-            // NSVisualEffectView 与所有图标合并成一张每帧重绘的离屏纹理。
-            background
-                .opacity(transitionProgress)
-            // 展开/收起：内容从 1.15 倍向内收缩并淡入，收起时反向放大淡出。
-            // scaleEffect 是纯渲染变换不触发布局，由 GPU 合成。
-            content
-                // 减弱动态效果时不缩放，只淡入淡出（P3-3）
-                .scaleEffect(MotionPreference.contentScale(
-                    progress: transitionProgress, reduceMotion: reduceMotion
-                ))
-                .opacity(transitionProgress)
-        }
-        // 收起态与跟手期间整体关闭命中测试，避免透明全屏层误启动应用。
-        .allowsHitTesting(model.isVisible && model.pinchTransitionProgress == nil)
+        // 根视图不读逐帧跟手进度（O9）：读 pinchTransitionProgress 会把根 body
+        // 登记为它的依赖，跟手期间（最高 125Hz）每帧重算整棵视图树（GeometryReader、
+        // 多个 onChange/onPreferenceChange 等）。逐帧重算范围限定在
+        // PanelTransitionContainer.body；命中测试门用只在会话起止翻转的
+        // isPinchInteracting，根视图不逐帧重算。
+        PanelTransitionContainer(
+            model: model,
+            reduceMotion: reduceMotion,
+            background: { background },
+            content: { content }
+        )
+        // 收起态与跟手会话期间整体关闭命中测试，避免透明全屏层误启动应用。
+        .allowsHitTesting(model.isVisible && !model.isPinchInteracting)
         .animation(MotionPreference.panelTransition(reduceMotion: reduceMotion), value: model.isVisible)
         .environment(model)
         .onChange(of: model.searchFocusTrigger) { _, _ in
@@ -812,6 +804,49 @@ struct PageBackgroundDropDelegate: DropDelegate {
             )
         }
         return accepted
+    }
+}
+
+// MARK: - 跟手过渡容器（O9：唯一读取逐帧进度的视图层）
+
+/// 只有这个容器读 `pinchTransitionProgress`：跟手期间（最高 125Hz）每帧重算
+/// 范围限定在它的 body，根视图 `LaunchpadContentView.body` 不再逐帧重算。
+/// 视觉行为与拆分前的根 ZStack 完全一致：背景只做透明度合成，缩放仅作用于
+/// 启动台内容（scaleEffect 是纯渲染变换不触发布局，由 GPU 合成）。
+struct PanelTransitionContainer<Background: View, Content: View>: View {
+    let model: LaunchpadModel
+    let reduceMotion: Bool
+    let background: Background
+    let content: Content
+
+    init(
+        model: LaunchpadModel,
+        reduceMotion: Bool,
+        @ViewBuilder background: () -> Background,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.model = model
+        self.reduceMotion = reduceMotion
+        self.background = background()
+        self.content = content()
+    }
+
+    /// 手势期间逐帧取实时进度；其他入口仍由可见性驱动完整弹簧动画。
+    private var transitionProgress: Double {
+        model.pinchTransitionProgress ?? (model.isVisible ? 1 : 0)
+    }
+
+    var body: some View {
+        ZStack {
+            background
+                .opacity(transitionProgress)
+            content
+                // 减弱动态效果时不缩放，只淡入淡出（P3-3）
+                .scaleEffect(MotionPreference.contentScale(
+                    progress: transitionProgress, reduceMotion: reduceMotion
+                ))
+                .opacity(transitionProgress)
+        }
     }
 }
 

@@ -808,6 +808,8 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
         wallpaperRefreshWork = nil
         removeAutoHideMonitors()
         pinchStartVisible = model.isVisible
+        // 命中测试门（O9）：只在会话起止翻转，根视图不逐帧重算。
+        model.isPinchInteracting = true
         if !model.isVisible {
             prepareForShowing()
             // isVisible 表示逻辑会话已开始；视觉仍完全由 pinchTransitionProgress 驱动。
@@ -816,7 +818,6 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
             cancelPageIdleSettle()
             pageGesture = InteractivePageGesture()
         }
-        removeAutoHideMonitors()
         panel?.ignoresMouseEvents = true
     }
 
@@ -841,6 +842,7 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
             update()
         }
         pinchStartVisible = nil
+        model.isPinchInteracting = false
 
         if targetVisible {
             hideWorkItem?.cancel()
@@ -861,6 +863,7 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
     private func resetPinchInteraction() {
         pinchStartVisible = nil
         model.pinchTransitionProgress = nil
+        model.isPinchInteracting = false
     }
 
     // MARK: - 窗口构建

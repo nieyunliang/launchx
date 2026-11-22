@@ -119,6 +119,10 @@ public final class LaunchpadModel {
     @ObservationIgnored public private(set) var lastLaunchError: String?
     /// 捏合手势的实时展开进度（0...1）；nil 表示由 isVisible 驱动常规过渡。
     public var pinchTransitionProgress: Double?
+    /// 捏合跟手会话进行中（O9）：只在会话开始/结束翻转（beginPinchGesture /
+    /// settlePinchGesture / resetPinchInteraction），不逐帧变化——根视图用
+    /// 它关闭命中测试，不会像读逐帧进度那样每帧重算。
+    public var isPinchInteracting = false
     /// 加载态（首扫未完成时）。
     public var isScanning: Bool = true
 

@@ -276,7 +276,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         var showMenuBar = store.state.settings.showMenuBarIcon
         if !showMenuBar {
             let settings = store.state.settings
-            // 手势只有拿到辅助功能权限才算有效入口（否则收得起、唤不起）。
+            // 原始触点手势通道无需辅助功能权限即有效（权限仅影响系统双开抑制）。
             let hasAlternativeEntry = settings.hotKey != .none
                 || TrackpadTouchMonitor.isEntryAvailable(enabled: settings.pinchGestureEnabled)
                 || settings.showDockIcon
