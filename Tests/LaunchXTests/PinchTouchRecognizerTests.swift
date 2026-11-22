@@ -847,4 +847,68 @@ struct PinchTouchRecognizerTests {
         #expect(eventsOut.allSatisfy { $0.signedProgress <= 0 },
                 "板 B 的事件不得混入板 A 的正进度")
     }
+
+    // MARK: 设备停止收尾（邮箱积压事件不得晚于 cancelled 送达）
+
+    /// 回归：stopDevice 旧实现直接 abort 同步投递 cancelled，邮箱里已调度、尚未
+    /// drain 的 changed 随后在主线程 drain 里晚到——控制器把它当新会话开启、
+    /// 再无终帧，面板卡在跟手态。收尾事件必须是「积压事件按序 + cancelled」，
+    /// 且关闭后的邮箱拒收晚到投递、已调度的 drain 取到空集。
+    @Test func shutdownFlushesMailboxBeforeCancelledAndClosesIt() {
+        let pipeline = TouchPipeline()
+        let ids: [Int32] = [1, 2, 3, 4]
+        var now: TimeInterval = 1000
+        var posted: [PinchGestureEvent] = []
+        for i in 0...6 {
+            let k = Float(1.0) - Float(i) * 0.05
+            let outcome = pipeline.recognizer.ingest(
+                crossFrame(ids: ids, k: k, state: i == 0 ? 3 : 4, span: 0.12), now: now)
+            posted.append(contentsOf: outcome.events)
+            _ = pipeline.mailbox.post(outcome.events)
+            now += 0.008
+        }
+        #expect(posted.contains { $0.phase == .changed }, "应处于投递中，邮箱有积压")
+
+        let events = pipeline.shutdownEvents()
+        #expect(events.map(\.phase) == [.began, .changed, .cancelled],
+                "积压事件按序在前、cancelled 收尾：\(events.map(\.phase))")
+
+        // 已调度的主线程 drain 取到空集；在途回调的晚到投递被丢弃、不再调度
+        #expect(pipeline.mailbox.drain().isEmpty)
+        #expect(!pipeline.mailbox.post([PinchGestureEvent(phase: .changed, signedProgress: 0.3)]))
+        #expect(pipeline.mailbox.drain().isEmpty)
+    }
+
+    /// 无会话时收尾为空；会话已正常 ended 但 ended 尚在邮箱：照常送出 ended，
+    /// 不追加 cancelled。
+    @Test func shutdownWithoutLiveSessionDeliversOnlyBacklog() {
+        #expect(TouchPipeline().shutdownEvents().isEmpty)
+
+        let pipeline = TouchPipeline()
+        let frames = pinchFrames(ids: [1, 2, 3, 4], kFrom: 3.0, kTo: 1.5, frames: 12)
+        var now: TimeInterval = 1000
+        for frame in frames {
+            _ = pipeline.mailbox.post(pipeline.recognizer.ingest(frame, now: now).events)
+            now += 0.008
+        }
+        let events = pipeline.shutdownEvents()
+        #expect(events.last?.phase == .ended, "已结束会话的 ended 必须送达：\(events.map(\.phase))")
+        #expect(!events.contains { $0.phase == .cancelled })
+    }
+
+    // MARK: 设备过滤（Magic Mouse 不进识别 pipeline）
+
+    /// 本机探针实测值：内建板 family 109、表面 12480×7680；Magic Mouse 2
+    /// family 112、表面 5152×9056（竖向）。
+    @Test func trackpadFilterExcludesMagicMouse() {
+        #expect(TrackpadTouchMonitor.isTrackpad(familyID: 109, surface: (12480, 7680)))
+        #expect(!TrackpadTouchMonitor.isTrackpad(familyID: 112, surface: (5152, 9056)))
+        // 族 ID 表之外的新款鼠标：竖向表面兜底排除
+        #expect(!TrackpadTouchMonitor.isTrackpad(familyID: 200, surface: (5000, 9000)))
+        // 只有族 ID / 只有尺寸
+        #expect(!TrackpadTouchMonitor.isTrackpad(familyID: 112, surface: nil))
+        #expect(TrackpadTouchMonitor.isTrackpad(familyID: nil, surface: (16000, 11000)))
+        // 信息全缺：按触控板处理（不误删触控板）
+        #expect(TrackpadTouchMonitor.isTrackpad(familyID: nil, surface: nil))
+    }
 }

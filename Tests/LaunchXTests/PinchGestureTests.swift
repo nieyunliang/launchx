@@ -138,6 +138,27 @@ struct PinchCloseSessionTests {
         #expect(model.pinchTransitionProgress == nil)
     }
 
+    /// 设备停止收尾序列（积压 changed 在前、cancelled 收尾）送入控制器后，
+    /// 面板回到起点、跟手态完全退出——不得残留 isPinchInteracting。
+    /// 反例（旧顺序 cancelled → changed）会让孤立的 changed 开启新会话卡住。
+    @Test func deviceShutdownSequenceLeavesNoStuckSession() throws {
+        let (controller, model, dir) = try makeController()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        model.show()
+        controller.handlePinchGesture(PinchGestureEvent(phase: .began, signedProgress: 0))
+        controller.handlePinchGesture(PinchGestureEvent(phase: .changed, signedProgress: -0.2))
+        // stopDevice 的收尾：邮箱积压的 changed，然后 abort 的 cancelled
+        controller.handlePinchGesture(PinchGestureEvent(phase: .changed, signedProgress: -0.3))
+        controller.handlePinchGesture(PinchGestureEvent(phase: .cancelled, signedProgress: -0.3))
+        #expect(model.isVisible)
+        #expect(model.pinchTransitionProgress == nil)
+        #expect(!model.isPinchInteracting, "收尾后不得残留跟手态")
+
+        // 对照：旧顺序（cancelled 先到、晚到的 changed 后到）会重开会话并卡住
+        controller.handlePinchGesture(PinchGestureEvent(phase: .changed, signedProgress: -0.3))
+        #expect(model.isPinchInteracting, "孤立 changed 确实会开启会话——收尾顺序必须保证它不晚于 cancelled")
+    }
+
     // MARK: 不抬手反向（捏合中途再张开 / 张开中途再捏合）
 
     /// 不抬手「捏合 → 张开」：过零后视觉钳在展开态（不弹回起点再塌缩），
