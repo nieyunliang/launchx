@@ -45,7 +45,7 @@ public final class GridKeyboardFocus {
 
 /// 网格键盘导航状态机（纯逻辑，便于单测）。
 ///
-/// 索引是当前页 `items` 的下标（LazyVGrid 按行优先排布，列数 = `density.columns`）。
+    /// 索引是当前页 `items` 的下标（网格按行优先排布，列数 = `density.columns`）。
 /// 语义约定：
 /// - 无焦点时 `next/previous`（Tab/Shift-Tab）落到首/末项，`.left/.up/.down/.right`
 ///   由调用方优先走翻页，不经过这里；
@@ -148,6 +148,9 @@ public struct LaunchpadContentView: View {
         .onChange(of: model.searchFocusTrigger) { _, _ in
             searchFocused = true
         }
+        .onChange(of: model.searchBlurTrigger) { _, _ in
+            searchFocused = false
+        }
     }
 
     // MARK: 背景：壁纸（捕获侧 CoreImage 预模糊）+ GlassTint / 毛玻璃回退
@@ -164,11 +167,14 @@ public struct LaunchpadContentView: View {
                 // 暗化叠层：壁纸路径重暗化、不加白 tint（保住壁纸饱和度，
                 // 对齐原版观感：壁纸色彩清晰可辨、白字可读）
                 Color.black.opacity(0.28)
-            } else {
+            } else if let material = model.settings.glassMaterial.material {
                 // 仅在无壁纸时启用全屏实时毛玻璃；壁纸已预模糊，无需叠加两套模糊。
-                VisualEffectBlur(material: model.settings.glassMaterial.material)
+                VisualEffectBlur(material: material)
                 Color.black.opacity(0.18)
                 LXColors.glassTint(LXColors.isDark)
+            } else {
+                // 材质「关闭」：不创建 NSVisualEffectView（纯色叠层，与「薄」有可见区别）
+                Color.black.opacity(0.62)
             }
         }
         .ignoresSafeArea()
@@ -185,7 +191,9 @@ public struct LaunchpadContentView: View {
 
                 if !model.searchQuery.isEmpty {
                     SearchResultsGrid()
-                } else if model.openedFolder != nil {
+                } else if model.openedFolderRecord != nil {
+                    // 用「记录仍存在」而不是 openedFolder != nil：文件夹被摘空删除后
+                    // 旧的打开态会只剩一块没有标题/关闭按钮的空白蒙层（F8 兜底）。
                     OpenedFolderView()
                 } else if model.settings.browsingStyle == .paged {
                     PagedGridArea(
@@ -198,7 +206,7 @@ public struct LaunchpadContentView: View {
                     ScrollGridArea(itemFrames: $itemFrames)
                 }
 
-                if model.settings.browsingStyle == .paged, model.searchQuery.isEmpty, model.openedFolder == nil {
+                if model.settings.browsingStyle == .paged, model.searchQuery.isEmpty, !model.isFolderViewActive {
                     PageIndicatorView()
                         .padding(.bottom, 40)
                 }
@@ -275,7 +283,7 @@ public struct LaunchpadContentView: View {
             isComposingText: composing,
             searchQuery: model.searchQuery,
             // 文件夹打开时优先关文件夹（既有分层），焦点层让位
-            hasGridFocus: gridFocus.focusedIndex != nil && model.openedFolder == nil
+            hasGridFocus: gridFocus.focusedIndex != nil && !model.isFolderViewActive
         ) {
         case .passThrough:
             return
@@ -299,10 +307,22 @@ public struct LaunchpadContentView: View {
             TextField(
                 "搜索应用",
                 text: Bindable(model).searchQuery,
-                prompt: Text("搜索应用").foregroundStyle(.white.opacity(0.85))
+                // 系统占位不可定制：聚焦态的占位由 field editor 路径绘制，颜色固定
+                // placeholderText 灰，prompt 的前景样式 / 属性字符串均映射不进去
+                // （实机实测三种写法都渲染成灰字，与白色放大镜图标不一致）。
+                // 这里用空 prompt 禁掉系统占位，由下方 overlay 自绘同色占位。
+                prompt: Text("")
             )
                 .textFieldStyle(.plain)
                 .focused($searchFocused)
+                .overlay(alignment: .leading) {
+                    if model.searchQuery.isEmpty, !model.searchIsComposing {
+                        Text("搜索应用")
+                            .font(.system(size: 15))
+                            .foregroundStyle(.white.opacity(0.85))
+                            .allowsHitTesting(false)
+                    }
+                }
                 .font(.system(size: 15))
                 .foregroundStyle(.white)
                 .onChange(of: model.searchQuery) { _, _ in
@@ -346,11 +366,15 @@ public struct LaunchpadContentView: View {
 
 // MARK: - 分页网格区
 
-/// 整条页面带 + 橡皮筋选框 + 背景放置目标。
+/// 窗口化页面带 + 橡皮筋选框 + 背景放置目标。
 ///
-/// LaunchOS 同款翻页：全部页一字排开成一条常驻条带，键盘/页码点/横滑落位
-/// 都只是条带单一 offset 的变化——无逐页视图重建、无逐帧 frame 上报洪水，
-/// 动画全程 GPU 合成；横滑跟手天然露出相邻页（条带本就连续）。
+/// LaunchOS 同款翻页：键盘/页码点/横滑落位都共享同一套条带 offset 语义——
+/// 只物化当前页 ±1 共 3 页，每页独立设置 offset
+/// `(pageIndex − settled) × pageWidth + pageDragOffset`，与整条常驻条带的
+/// 单一 offset 在视觉上逐帧等价（横滑天然露出相邻页），但跟手每帧只重算
+/// 3 页（约 105 cell），成本不再随总页数增长；落位动画期间把提交目标页也
+/// 提前建好（`pendingCommitDirection`），原子换页帧不再物化新页。
+/// 跨多页跳转（页码点长跳）为直接切换，±1 翻页动画不变。
 struct PagedGridArea: View {
     @Environment(LaunchpadModel.self) private var model
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -364,27 +388,37 @@ struct PagedGridArea: View {
             let settledIndex = model.pageCount > 0
                 ? min(model.currentPage, model.pageCount - 1)
                 : 0
+            // 物化窗口：稳态 settled±1 共 3 页；落位动画期间把提交目标页
+            // （settled + 方向）一并提前物化（共 4 页，多出的那页在视口外），
+            // 让 finishDragCommit 的原子换页帧不含新页构建开销。
+            let commitTarget = model.pendingCommitDirection.map {
+                min(max(settledIndex + $0, 0), model.pageCount - 1)
+            } ?? settledIndex
+            let windowStart = max(min(settledIndex, commitTarget) - 1, 0)
+            let windowEnd = min(max(settledIndex, commitTarget) + 2, model.pageCount)
             ZStack(alignment: .topLeading) {
-                HStack(spacing: 0) {
-                    ForEach(0..<max(model.pageCount, 1), id: \.self) { pageIndex in
-                        PageGridView(
-                            pageIndex: pageIndex,
-                            focusedSlot: pageIndex == model.currentPage ? gridFocus.focusedIndex : nil
-                        )
-                        .frame(width: width, height: proxy.size.height)
-                    }
+                ForEach(windowStart..<max(windowEnd, windowStart + 1), id: \.self) { pageIndex in
+                    PageGridView(
+                        pageIndex: pageIndex,
+                        focusedSlot: pageIndex == model.currentPage ? gridFocus.focusedIndex : nil
+                    )
+                    .frame(width: width, height: proxy.size.height)
+                    // 每页独立 offset：与整条条带的单一 offset 逐帧等价
+                    .offset(x: CGFloat(pageIndex - settledIndex) * width + model.pageDragOffset)
                 }
-                .offset(x: -CGFloat(settledIndex) * width + model.pageDragOffset)
 
                 marqueeOverlay(in: proxy)
             }
             .clipped()
             .coordinateSpace(name: "pageViewSpace")
+            // 框选坐标上报只在此分支开启：scroll 模式滚动时逐行物化 cell 的
+            // preference 聚合 + 根视图 itemFrames 重写会让整树反复重算。
+            .environment(\.itemFrameReportingEnabled, true)
             .contentShape(Rectangle())
             .onTapGesture {
                 model.handleBackgroundTap()
             }
-            .contextMenu { pageMenuItems }
+            .contextMenu { PageBackgroundMenuItems() }
             .gesture(marqueeGesture(in: proxy))
             .onDrop(of: [DragPayload.type], delegate: PageBackgroundDropDelegate(model: model, pageIndex: model.currentPage))
             .onMoveCommand { direction in
@@ -398,8 +432,8 @@ struct PagedGridArea: View {
                 default: break
                 }
             }
-            // 对齐必须显式 topLeading：frame 默认居中会把 3 页宽的条带左移一页，
-            // 表现为「每页显示下一页的内容、末页空白」（首页内容永远不可见）
+            // 对齐必须显式 topLeading：页带原点恒在视口左上角，offset 相对它计算
+            // （默认居中会把整块内容挤偏半格的留白）
             .frame(width: proxy.size.width, height: proxy.size.height, alignment: .topLeading)
             .onAppear { model.pageWidth = proxy.size.width }
             .onChange(of: proxy.size.width) { _, width in model.pageWidth = width }
@@ -407,15 +441,6 @@ struct PagedGridArea: View {
         // 键盘/页码点翻页与横滑落位同曲线同时长（条带整段滑动）；
         // 减弱动态效果时只缩短时长，仍保留位移（避免「瞬间跳变」的观感）
         .animation(MotionPreference.pageSlide(reduceMotion: reduceMotion), value: model.currentPage)
-    }
-
-    /// 页面空白处右键菜单（承接原版 More 菜单入口）。
-    @ViewBuilder private var pageMenuItems: some View {
-        Button("整理布局…") { model.onOpenReorganize?() }
-        Button("设置…") { model.onOpenSettings?() }
-        Divider()
-        Button("新建文件夹") { model.createNewFolderOnCurrentPage() }
-        Button("解散全部文件夹") { model.ungroupAllFolders() }
     }
 
     // MARK: 橡皮筋
@@ -490,33 +515,43 @@ struct PageGridView: View {
     /// 键盘焦点格位（P3-4）：仅当前页会传入非 nil。
     var focusedSlot: Int? = nil
 
-    private var columns: [GridItem] {
-        Array(repeating: GridItem(.fixed(metrics.cellWidth), spacing: metrics.columnSpacing), count: model.density.columns)
-    }
-
     var body: some View {
         Group {
             if pageIndex < model.layout.pages.count {
                 let items = model.layout.pages[pageIndex].items
-                LazyVGrid(columns: columns, spacing: metrics.gridSpacing) {
-                    ForEach(Array(items.enumerated()), id: \.element) { slotIndex, item in
-                        switch item {
-                        case let .app(appID):
-                            if let app = model.layout.apps[appID] {
-                                AppCell(
-                                    app: app,
-                                    pageIndex: pageIndex,
-                                    folderID: nil,
-                                    isSearchResult: false,
-                                    isKeyboardFocused: focusedSlot == slotIndex
-                                )
-                                .id(slotIndex)
+                // 固定行列网格（行优先切片，与 LazyVGrid 排布一致）：每页 ≤35 格
+                // （默认密度 7×5，其他密度也在几十格量级），Lazy 的按需物化带不来
+                // 任何收益，反而让几何驱动的逐帧重物化成为跟手掉帧的元凶。
+                let columnCount = model.density.columns
+                let rows: [[SlotItem]] = stride(from: 0, to: items.count, by: columnCount).map {
+                    Array(items[$0..<min($0 + columnCount, items.count)])
+                }
+                VStack(alignment: .center, spacing: metrics.gridSpacing) {
+                    ForEach(rows.indices, id: \.self) { rowIndex in
+                        HStack(alignment: .center, spacing: metrics.columnSpacing) {
+                            ForEach(rows[rowIndex].indices, id: \.self) { columnIndex in
+                                let slotIndex = rowIndex * columnCount + columnIndex
+                                switch rows[rowIndex][columnIndex] {
+                                case let .app(appID):
+                                    if let app = model.layout.apps[appID] {
+                                        AppCell(
+                                            app: app,
+                                            pageIndex: pageIndex,
+                                            folderID: nil,
+                                            isSearchResult: false,
+                                            isKeyboardFocused: focusedSlot == slotIndex
+                                        )
+                                        .frame(width: metrics.cellWidth)
+                                        .id(slotIndex)
+                                    }
+                                case let .folder(folder):
+                                    // FolderCell 由 panel 组维护，焦点环在容器侧叠加（P3-4）
+                                    FolderCell(folder: folder, pageIndex: pageIndex)
+                                        .overlay { folderFocusRing(slotIndex: slotIndex) }
+                                        .frame(width: metrics.cellWidth)
+                                        .id(slotIndex)
+                                }
                             }
-                        case let .folder(folder):
-                            // FolderCell 由 panel 组维护，焦点环在容器侧叠加（P3-4）
-                            FolderCell(folder: folder, pageIndex: pageIndex)
-                                .overlay { folderFocusRing(slotIndex: slotIndex) }
-                                .id(slotIndex)
                         }
                     }
                 }
@@ -555,29 +590,81 @@ struct PageGridView: View {
 // MARK: - 滚动模式
 
 /// Scroll 模式：全部页面纵向连续滚动（仅纵向锁定）。
+///
+/// 用 `scrollPosition(id:)` 跟踪可视页并写回 `model.currentPage`——
+/// 旧实现从不更新当前页，导致滚动模式下多选合并 / 拖放建夹都用启动时的第 1 页。
 struct ScrollGridArea: View {
     @Environment(LaunchpadModel.self) private var model
     @Binding var itemFrames: [String: CGRect]
+    /// 可视页的 id（由滚动位置驱动）。
+    @State private var visiblePageID: UUID?
 
     var body: some View {
         ScrollView(.vertical) {
             LazyVStack(spacing: 44) {
-                ForEach(Array(model.layout.pages.enumerated()), id: \.element.id) { pageIndex, _ in
+                ForEach(Array(model.layout.pages.enumerated()), id: \.element.id) { pageIndex, page in
                     PageGridView(pageIndex: pageIndex)
                         .frame(minHeight: 360)
-                        // 每个页面各自接收投放：滚动模式下空白处拖入应用应落到「那一页」，
-                        // 之前统一按第 0 页处理，用户在第 N 页拖放后看不到落点（P2-1）。
+                        .id(page.id)
+                        // 每个页面各自接收投放：滚动模式下空白处拖入应用应落到「那一页」。
                         .onDrop(
                             of: [DragPayload.type],
                             delegate: PageBackgroundDropDelegate(model: model, pageIndex: pageIndex)
                         )
                 }
             }
+            .scrollTargetLayout()
             .padding(.vertical, 8)
         }
+        .scrollPosition(id: $visiblePageID, anchor: .top)
         .scrollBounceBehavior(.basedOnSize)
         .coordinateSpace(name: "pageSpace")
+        .onChange(of: visiblePageID) { _, pageID in
+            syncCurrentPage(with: pageID)
+        }
+        .onChange(of: model.currentPage) { _, _ in
+            scrollToCurrentPage()
+        }
+        .onAppear {
+            scrollToCurrentPage()
+            syncCurrentPage(with: visiblePageID)
+        }
         .onTapGesture { model.handleBackgroundTap() }
+        .contextMenu { PageBackgroundMenuItems() }
+    }
+
+    /// 滚动位置变化 → 写回当前页（多选合并 / 右键菜单 / 拖放落点都以它为准）。
+    private func syncCurrentPage(with pageID: UUID?) {
+        guard let pageID,
+              let index = model.layout.pages.firstIndex(where: { $0.id == pageID }) else { return }
+        if model.currentPage != index {
+            model.currentPage = index
+        }
+    }
+
+    /// 外部页码变化（唤起恢复 lastViewedPage / 密度变化钳位）→ 滚动到对应页。
+    private func scrollToCurrentPage() {
+        let pages = model.layout.pages
+        guard pages.indices.contains(model.currentPage) else { return }
+        let id = pages[model.currentPage].id
+        if visiblePageID != id {
+            visiblePageID = id
+        }
+    }
+}
+
+// MARK: - 页面空白处右键菜单（分页 / 滚动模式共用）
+
+/// 页面空白处右键菜单（承接原版 More 菜单入口）。
+struct PageBackgroundMenuItems: View {
+    @Environment(LaunchpadModel.self) private var model
+
+    var body: some View {
+        Button("整理布局…") { model.onOpenReorganize?() }
+        Button("设置…") { model.onOpenSettings?() }
+        Divider()
+        Button("新建文件夹") { model.createNewFolderOnCurrentPage() }
+        Button("解散全部文件夹") { model.ungroupAllFolders() }
     }
 }
 
@@ -639,7 +726,7 @@ struct SearchResultsGrid: View {
                         if let app = model.layout.apps[appID] {
                             AppCell(app: app, pageIndex: 0, folderID: nil, isSearchResult: true)
                                 .overlay(alignment: .topLeading) {
-                                    if index == model.searchSelectedIndex {
+                                    if index == model.clampedSearchSelectedIndex {
                                         RoundedRectangle(cornerRadius: 12)
                                             .strokeBorder(LXColors.accent, lineWidth: 2)
                                             .padding(-4)

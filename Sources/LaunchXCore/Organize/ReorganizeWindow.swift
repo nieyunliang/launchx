@@ -18,7 +18,16 @@ final class ReorganizeSession {
     private let store: LayoutStore
     private let model: LaunchpadModel
 
-    private(set) var undoSnapshot: LayoutSnapshot?
+    /// 可撤销快照：布局 + 排序设置。
+    /// 只还原布局是不够的——`apply` 同时把 activeSortKey/sortAscending 写进了设置，
+    /// 撤销后若不回滚，拖拽仍被禁用，且下次启动/重扫的 `applyActiveSort` 会把布局再排回去。
+    struct UndoSnapshot {
+        let layout: LayoutSnapshot
+        let activeSortKey: SortKey
+        let sortAscending: Bool
+    }
+
+    private(set) var undoSnapshot: UndoSnapshot?
     /// 最近一次应用的操作名（撤销条文案用）。
     private(set) var lastAppliedLabel: String?
 
@@ -36,6 +45,9 @@ final class ReorganizeSession {
         let settings = store.state.settings
         let capacity = max(settings.gridDensity.capacity, 1)
         let before = store.state.layout
+        // 固定方向键（最近使用 / 最早添加…）的方向由键自身决定，忽略窗口里的「升序」开关；
+        // 与 applyActiveSort 共用 effectiveAscending，否则应用后下次启动/重扫顺序会翻转。
+        let ascending = request.sortKey.effectiveAscending(fallback: request.ascending)
         store.updateLayout { layout in
             let options = SortOptions(
                 alsoSortFolderContents: request.alsoSortFolderContents,
@@ -47,7 +59,7 @@ final class ReorganizeSession {
                 SortEngine.apply(
                     &layout,
                     key: request.sortKey,
-                    ascending: request.ascending,
+                    ascending: ascending,
                     scope: request.scope,
                     options: options
                 )
@@ -65,9 +77,15 @@ final class ReorganizeSession {
                 )
             }
         }
-        // 排序生效后同步激活模式（Custom 之外禁拖拽）
+        // 排序生效后同步激活模式（Custom 之外禁拖拽），并记录方向：
+        // 非固定方向键把本次升/降序写回设置，保证下次启动 applyActiveSort 不会翻回去。
         if case .sort = request.action {
-            model.activeSortKey = request.sortKey
+            store.updateSettings { newSettings in
+                newSettings.activeSortKey = request.sortKey
+                if !request.sortKey.hasFixedDirection {
+                    newSettings.sortAscending = ascending
+                }
+            }
         }
         model.currentPage = min(model.currentPage, max(model.pageCount - 1, 0))
 
@@ -77,7 +95,11 @@ final class ReorganizeSession {
             ToastManager.shared.info(request.action.unchangedMessage)
             return .unchanged
         }
-        undoSnapshot = before
+        undoSnapshot = UndoSnapshot(
+            layout: before,
+            activeSortKey: settings.activeSortKey,
+            sortAscending: settings.sortAscending
+        )
         lastAppliedLabel = request.action.label
         ToastManager.shared.success("布局已更新，可点「撤销」恢复")
         return .changed
@@ -86,7 +108,11 @@ final class ReorganizeSession {
     /// 恢复上一次整理前的布局并落盘。仅在快照存在时可用（幂等）。
     func undo() {
         guard let snapshot = undoSnapshot else { return }
-        store.updateLayout { $0 = snapshot }
+        store.updateLayout { $0 = snapshot.layout }
+        store.updateSettings { settings in
+            settings.activeSortKey = snapshot.activeSortKey
+            settings.sortAscending = snapshot.sortAscending
+        }
         undoSnapshot = nil
         lastAppliedLabel = nil
         model.currentPage = min(model.currentPage, max(model.pageCount - 1, 0))
@@ -133,6 +159,7 @@ public final class ReorganizeWindowController: NSObject, NSWindowDelegate {
             window.delegate = self
             self.window = window
         }
+        window?.level = LaunchpadWindowController.childWindowLevel
         NSApp.activate(ignoringOtherApps: true)
         WindowFade.fadeIn(window!)
     }
@@ -217,7 +244,15 @@ struct ReorganizeContentView: View {
                         }
                     }
                     .labelsHidden()
-                    Toggle("升序（关闭为降序）", isOn: $ascending)
+                    if sortKey.hasFixedDirection {
+                        // 固定方向键（最近使用 / 最早添加…）不可反转：显示最终方向，
+                        // 避免用户误以为「升序」开关会生效（应用后启动/重扫顺序还会翻回去）。
+                        Text("「\(sortKey.label)」方向固定：\(sortKey.effectiveAscending(fallback: true) ? "最早在前" : "最新在前")")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Toggle("升序（关闭为降序）", isOn: $ascending)
+                    }
                     Toggle("同时排序文件夹内应用", isOn: $alsoSortFolderContents)
                 }
                 .padding(4)

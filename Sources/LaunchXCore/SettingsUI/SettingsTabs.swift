@@ -17,13 +17,11 @@ struct AppsSettingsTab: View {
                         ))
                             .toggleStyle(.switch)
                             .labelsHidden()
+                            .accessibilityLabel("启用来源 \(prefs.displayName(for: source))")
                         VStack(alignment: .leading, spacing: 1) {
                             if source.kind == .defaultApps {
                                 Text("应用程序")
                                     .font(.system(size: 13, weight: .medium))
-                                Text("默认路径（应用程序 / 系统应用）")
-                                    .font(.system(size: 10))
-                                    .foregroundStyle(.secondary)
                             } else {
                                 Text(source.path)
                                     .font(.system(size: 12, design: .monospaced))
@@ -43,7 +41,7 @@ struct AppsSettingsTab: View {
                                 Image(systemName: "trash")
                             }
                             .buttonStyle(.borderless)
-                            .help("删除来源（会提示将移除的应用数）")
+                            .help("删除来源")
                             .accessibilityLabel("删除来源 \(prefs.displayName(for: source))")
                         }
                     }
@@ -58,9 +56,6 @@ struct AppsSettingsTab: View {
                         }
                     }
                 }
-                Text("关闭或删除来源会移除该目录下的应用并丢失其排列，操作前会二次确认。")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
             }
 
             Section("排序方式") {
@@ -72,23 +67,30 @@ struct AppsSettingsTab: View {
                 }
                 if !prefs.store.state.settings.activeSortKey.hasFixedDirection,
                    prefs.store.state.settings.activeSortKey != .custom {
-                    Toggle("升序（关闭为降序，最新在前）", isOn: Binding(
+                    Picker("排序方向", selection: Binding(
                         get: { prefs.store.state.settings.sortAscending },
                         set: { prefs.applySortAscending($0) }
-                    ))
+                    )) {
+                        Text("升序").tag(true)
+                        Text("降序").tag(false)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .accessibilityLabel("排序方向")
                 }
-                Text(prefs.store.state.settings.activeSortKey == .custom
-                     ? "「自定义」保留手动拖拽整理的布局。"
-                     : "切换后立即重排全部页面；此模式下拖拽整理被禁用，启动应用后按所选规则自动重排。")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
             }
 
             Section("摆放规则") {
-                Picker("Apple 应用位置", selection: prefs.binding(\.appleAppsPosition)) {
+                Picker("Apple 应用位置", selection: Binding(
+                    get: { prefs.store.state.settings.appleAppsPosition },
+                    set: { prefs.setAppleAppsPosition($0) }
+                )) {
                     ForEach(AppleAppsPosition.allCases, id: \.self) { Text($0.label).tag($0) }
                 }
-                Picker("文件夹位置", selection: prefs.binding(\.folderPosition)) {
+                Picker("文件夹位置", selection: Binding(
+                    get: { prefs.store.state.settings.folderPosition },
+                    set: { prefs.setFolderPosition($0) }
+                )) {
                     ForEach(FolderPosition.allCases, id: \.self) { Text($0.label).tag($0) }
                 }
             }
@@ -98,7 +100,7 @@ struct AppsSettingsTab: View {
                     .filter(\.hidden)
                     .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
                 if hiddenApps.isEmpty {
-                    Text("没有隐藏的应用。右键任意应用 → 隐藏。")
+                    Text("暂无隐藏的应用")
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                 } else {
@@ -110,9 +112,7 @@ struct AppsSettingsTab: View {
                             Text(app.name)
                             Spacer()
                             Button("取消隐藏") {
-                                prefs.store.updateLayout { layout in
-                                    layout.apps[app.id]?.hidden = false
-                                }
+                                prefs.unhideApp(id: app.id)
                             }
                         }
                     }
@@ -131,9 +131,9 @@ struct AppsSettingsTab: View {
 
     private func kindLabel(_ kind: SourceConfig.Kind) -> String {
         switch kind {
-        case .defaultApps: "默认路径"
-        case .systemApps: "系统应用目录"
-        case .userApps: "用户应用目录"
+        case .defaultApps: "默认"
+        case .systemApps: "系统应用"
+        case .userApps: "用户应用"
         case .custom: "自定义"
         }
     }
@@ -170,10 +170,12 @@ struct InterfaceSettingsTab: View {
             }
 
             Section("玻璃材质") {
+                Toggle("模糊壁纸（全屏模式）", isOn: prefs.binding(\.blurWallpaper))
+                // 有壁纸背景时材质强度不起作用：禁用控件代替文字说明。
                 Picker("材质强度", selection: prefs.binding(\.glassMaterial)) {
                     ForEach(GlassMaterial.allCases, id: \.self) { Text($0.label).tag($0) }
                 }
-                Toggle("模糊壁纸（全屏模式）", isOn: prefs.binding(\.blurWallpaper))
+                .disabled(prefs.store.state.settings.blurWallpaper && CGPreflightScreenCaptureAccess())
             }
 
             Section("显示位置与收起") {
@@ -239,7 +241,6 @@ struct InfoSettingsTab: View {
                     onboardingController = controller
                     controller.show()
                 }
-                .help("重新播放首次使用引导（不会修改任何设置）")
             }
 
             Spacer()

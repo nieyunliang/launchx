@@ -259,6 +259,7 @@ public final class UninstallWindowController: NSObject, NSWindowDelegate {
             window.delegate = self
             self.window = window
         }
+        window?.level = LaunchpadWindowController.childWindowLevel
         NSApp.activate(ignoringOtherApps: true)
         WindowFade.fadeIn(window!)
         model.startScan()
@@ -547,6 +548,8 @@ struct UninstallItemRowView: View {
             ))
                 .toggleStyle(.checkbox)
                 .labelsHidden()
+                .accessibilityLabel("选择 \(item.url.lastPathComponent)")
+                .accessibilityValue(item.category.displayName)
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 6) {
                     Text(item.url.lastPathComponent)
@@ -576,6 +579,7 @@ struct UninstallItemRowView: View {
         }
         .contentShape(Rectangle())
         .onTapGesture(perform: onToggle)
+        .accessibilityElement(children: .contain)
     }
 }
 

@@ -42,6 +42,26 @@ struct StoreTests {
         #expect(FileManager.default.fileExists(atPath: dir.path))
     }
 
+    @Test func loadPurgesEmptyFoldersFromLegacyStore() throws {
+        let dir = tempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        // 写入一个含空文件夹的布局（旧版本 / 手工编辑 store.json 的残留形态）
+        let store = LayoutStore(directory: dir)
+        store.updateLayout { layout in
+            layout.apps["x"] = makeApp("x")
+            layout.pages = [
+                PageRecord(items: [.app(id: "x")]),
+                PageRecord(items: [.folder(FolderRecord(name: "Empty", appIDs: []))]),
+            ]
+        }
+
+        // 重新加载：空文件夹被清扫，清空后的空页一并移除
+        let reloaded = LayoutStore(directory: dir)
+        #expect(reloaded.state.layout.pages.count == 1)
+        #expect(reloaded.state.layout.pages[0].items.compactMap(\.appID) == ["x"])
+    }
+
     @Test func missingAppFieldKeepsLayoutAndSettings() throws {
         let dir = tempDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -258,6 +278,125 @@ struct AppIndexAndSyncTests {
         #expect(records.count == 1)
         #expect(records[0].isAlias)
         #expect(records[0].name == "Shortcut")
+    }
+
+    // MARK: 自定义来源递归扫描（含子目录）
+
+    @Test func customSourceIncludesSubdirectoryApps() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchXRecursive-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        // 根 / 一层 / 两层 / 三层子目录各放一个应用，全部应被收进扫描结果
+        let level1 = dir.appendingPathComponent("分类", isDirectory: true)
+        let level2 = level1.appendingPathComponent("工具", isDirectory: true)
+        let level3 = level2.appendingPathComponent("更深", isDirectory: true)
+        try FileManager.default.createDirectory(at: level3, withIntermediateDirectories: true)
+        try makeFakeAppBundle(at: dir, name: "TopApp", bundleID: "rec.top")
+        try makeFakeAppBundle(at: level1, name: "LevelOne", bundleID: "rec.l1")
+        try makeFakeAppBundle(at: level2, name: "LevelTwo", bundleID: "rec.l2")
+        try makeFakeAppBundle(at: level3, name: "LevelThree", bundleID: "rec.l3")
+
+        let records = AppIndex.scan(sources: [SourceConfig(path: dir.path, kind: .custom)])
+        #expect(Set(records.map(\.id)) == ["rec.top", "rec.l1", "rec.l2", "rec.l3"])
+    }
+
+    @Test func customSourceStopsRecursionAtDepthLimit() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchXDeepLimit-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        // 第 4 层子目录超过深度上限（3），里面的应用不收
+        let level3 = dir
+            .appendingPathComponent("一", isDirectory: true)
+            .appendingPathComponent("二", isDirectory: true)
+            .appendingPathComponent("三", isDirectory: true)
+        let level4 = level3.appendingPathComponent("四", isDirectory: true)
+        try FileManager.default.createDirectory(at: level4, withIntermediateDirectories: true)
+        try makeFakeAppBundle(at: level3, name: "Boundary", bundleID: "rec.boundary")
+        try makeFakeAppBundle(at: level4, name: "TooDeep", bundleID: "rec.deep")
+
+        let records = AppIndex.scan(sources: [SourceConfig(path: dir.path, kind: .custom)])
+        #expect(records.map(\.id) == ["rec.boundary"])
+    }
+
+    @Test func customSourceDoesNotDescendIntoAppBundle() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchXNestBundle-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        // 应用 bundle 内部的 Helper 不应被当作独立应用
+        try makeFakeAppBundle(at: dir, name: "Outer", bundleID: "nest.outer")
+        let pluginDir = dir.appendingPathComponent("Outer.app/Contents/PlugIns", isDirectory: true)
+        try FileManager.default.createDirectory(at: pluginDir, withIntermediateDirectories: true)
+        try makeFakeAppBundle(at: pluginDir, name: "Helper", bundleID: "nest.helper")
+
+        let records = AppIndex.scan(sources: [SourceConfig(path: dir.path, kind: .custom)])
+        #expect(records.map(\.id) == ["nest.outer"])
+    }
+
+    @Test func customSourceSkipsHiddenSubdirectories() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchXHiddenDir-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let hidden = dir.appendingPathComponent(".备份", isDirectory: true)
+        try FileManager.default.createDirectory(at: hidden, withIntermediateDirectories: true)
+        try makeFakeAppBundle(at: hidden, name: "HiddenApp", bundleID: "rec.hidden")
+
+        let records = AppIndex.scan(sources: [SourceConfig(path: dir.path, kind: .custom)])
+        #expect(records.isEmpty)
+    }
+
+    @Test func scanSpecsMarkCustomSourcesAndUserAppsRecursive() {
+        let builtin = SourceConfig.defaultApps()
+        let legacy = SourceConfig(path: "/Legacy/Apps", kind: .userApps)
+        let custom = SourceConfig(path: "/Custom/Apps", kind: .custom)
+        let specs = SourceConfig.scanSpecs(from: [builtin, legacy, custom])
+        let byPath = Dictionary(uniqueKeysWithValues: specs.map { ($0.url.path, $0.recursive) })
+        #expect(byPath["/Applications"] == false)  // 内置标准目录对齐 Launchpad，不递归
+        #expect(byPath["/Legacy/Apps"] == false)   // 旧版默认来源（存量兼容）不递归
+        #expect(byPath["/Custom/Apps"] == true)    // 自定义目录递归下钻
+        // ~/Applications 例外：浏览器等工具把应用快捷方式放进其子文件夹（如「Chrome Apps」）
+        let userApps = SourceConfig.userApplicationsPath()
+        if FileManager.default.fileExists(atPath: userApps) {
+            #expect(byPath[userApps] == true)
+        }
+    }
+
+    @Test func customSourceUpgradesOverlappingBuiltinDirectoryToRecursive() {
+        // 内置「应用程序」对 ~/Applications 本身就递归；用户把同一目录又添加为自定义来源时，
+        // 该目录不能被去重丢弃，递归标记取并集后仍为 true（含子目录）
+        let homeApps = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Applications").path
+        let specs = SourceConfig.scanSpecs(from: [
+            SourceConfig.defaultApps(),
+            SourceConfig(path: homeApps, kind: .custom),
+        ])
+        let byPath = Dictionary(uniqueKeysWithValues: specs.map { ($0.url.path, $0.recursive) })
+        #expect(byPath[homeApps] == true)
+        // 未被显式添加的标准目录保持只扫第一层
+        #expect(byPath["/Applications"] == false)
+    }
+
+    @Test func watchDirectoriesExpandRecursiveSubdirectories() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchXWatch-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let level1 = dir.appendingPathComponent("分类", isDirectory: true)
+        let level2 = level1.appendingPathComponent("工具", isDirectory: true)
+        try FileManager.default.createDirectory(at: level2, withIntermediateDirectories: true)
+        try makeFakeAppBundle(at: level1, name: "Nested", bundleID: "watch.nested")
+
+        let rootURL = URL(fileURLWithPath: dir.path, isDirectory: true)
+        // /var 等路径存在符号链接前缀，统一用标准化路径比较（监听集合本身与链接前缀无关）
+        let paths = Set([rootURL, level1, level2].map(\.standardizedFileURL.path))
+        // 递归来源：根与全部子目录都纳入监听（子目录新增应用也能触发重扫）
+        let customDirs = SourceConfig.watchDirectories(from: [SourceConfig(path: dir.path, kind: .custom)])
+        #expect(Set(customDirs.map(\.standardizedFileURL.path)) == paths)
+        // 非递归来源（旧版默认来源兼容）：只监听根目录本身
+        let legacyDirs = SourceConfig.watchDirectories(from: [SourceConfig(path: dir.path, kind: .userApps)])
+        #expect(legacyDirs.map(\.standardizedFileURL.path) == [rootURL.standardizedFileURL.path])
     }
 
     @Test func displayNameFallbackChain() {

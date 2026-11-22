@@ -289,10 +289,42 @@ public struct LayoutSnapshot: Codable, Hashable, Sendable {
         }
     }
 
+    /// 把应用从任意文件夹中摘除（文件夹被摘空后一并移除）；不动直接摆放与注册表。
+    ///
+    /// 用于拖放 / 建夹前的防御：同一应用只允许出现在一个位置（直接摆放或某个文件夹内）。
+    /// 必须遍历**全部**页面与文件夹：历史数据里同一应用可能已被放进多个文件夹，
+    /// 只摘第一个会让重复项永久残留（槽位倒序遍历，摘空删除时下标不前移）。
+    public mutating func removeAppFromAnyFolder(_ appID: String) {
+        for pageIndex in pages.indices {
+            for slotIndex in pages[pageIndex].items.indices.reversed() {
+                guard case var .folder(folder) = pages[pageIndex].items[slotIndex],
+                      folder.appIDs.contains(appID) else { continue }
+                folder.appIDs.removeAll { $0 == appID }
+                if folder.appIDs.isEmpty {
+                    pages[pageIndex].items.remove(at: slotIndex)
+                } else {
+                    pages[pageIndex].items[slotIndex] = .folder(folder)
+                }
+            }
+        }
+    }
+
+    /// 把应用从网格上摘除（直接摆放与文件夹内都摘），不动注册表与 hidden 标记。
+    /// 隐藏 / 取消摆放等场景使用；与 `removeAppFromAnyFolder` 的区别是这里也清直接摆放。
+    public mutating func detachFromGrid(_ appID: String) {
+        removeAppFromAnyFolder(appID)
+        for pageIndex in pages.indices {
+            pages[pageIndex].items.removeAll { $0.appID == appID }
+        }
+        removeEmptyPages()
+    }
+
     /// 追加应用到指定页末尾（页满顺延到下一页，必要时新建页）。
     /// 返回实际落位的页下标。
     @discardableResult
     public mutating func appendApp(id: String, toPage pageIndex: Int, capacityPerPage capacity: Int) -> Int {
+        // 防御：容量非法时不能再进下面的 while（capacity <= 0 会无限建页直到内存耗尽）。
+        guard capacity > 0 else { return min(max(pageIndex, 0), max(pages.count - 1, 0)) }
         var index = min(pageIndex, pages.count)
         if index == pages.count {
             pages.append(PageRecord())
@@ -316,6 +348,18 @@ public struct LayoutSnapshot: Codable, Hashable, Sendable {
             pages.append(PageRecord())
         }
     }
+
+    /// 清扫空文件夹（成员为 0 的槽位），随后清理空页。
+    ///
+    /// 布局不变量「空文件夹不允许存在」：拖出成员 / 卸载 / 隐藏等路径都会即时删除被摘空的
+    /// 文件夹，这里兜底两类残留——旧版本 store.json 落下的空夹、手工编辑产生的空夹。
+    /// 由 LayoutStore 加载时调用；运行期所有建夹路径都保证成员非空。
+    public mutating func purgeEmptyFolders() {
+        for pageIndex in pages.indices {
+            pages[pageIndex].items.removeAll { $0.folder?.appIDs.isEmpty == true }
+        }
+        removeEmptyPages()
+    }
 }
 
 // MARK: - GridDensity
@@ -326,6 +370,21 @@ public struct GridDensity: Hashable, Codable, Sendable, CaseIterable, Identifiab
     public let rows: Int
 
     public init(columns: Int, rows: Int) {
+        self.columns = columns
+        self.rows = rows
+    }
+
+    private enum CodingKeys: String, CodingKey { case columns, rows }
+
+    /// 来自磁盘的密度必须收敛到合法范围：`columns <= 0` 会让页容量为 0（appendApp 死循环），
+    /// 负数还会在 `Array(repeating:count:)` 处直接 trap。损坏 / 外部编辑的 store.json
+    /// 不应让应用启动即挂死，因此这里 clamp 而不是抛错。
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let decodedColumns = (try? c.decodeIfPresent(Int.self, forKey: .columns)) ?? nil
+        let decodedRows = (try? c.decodeIfPresent(Int.self, forKey: .rows)) ?? nil
+        let columns = min(max(decodedColumns ?? Self.default.columns, 1), 32)
+        let rows = min(max(decodedRows ?? Self.default.rows, 1), 32)
         self.columns = columns
         self.rows = rows
     }

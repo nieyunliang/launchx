@@ -1,4 +1,4 @@
-import AppKit
+@preconcurrency import AppKit
 import Foundation
 
 /// 图标仓库：加载 + 缓存应用图标，支持单色染色（白色→红 / 红→白）。
@@ -43,12 +43,50 @@ public final class AppIconRepository {
         return image
     }
 
+    /// 后台预热图标缓存：启动 / 重扫后一次性把全部应用图标按显示像素尺寸重采样入缓存。
+    ///
+    /// 分页条带一次性物化全部页、scroll 模式滚动跨页时集中物化新 cell——
+    /// 这些时机遇到缓存 miss 会在主线程同步做 `NSWorkspace` 查询 + 256px 位图
+    /// 重采样（每个 1-2ms，几十个图标就是一次明显的掉帧），预热后网格渲染全部命中。
+    /// 系统图标查询（NSWorkspace 主线程 API）批量进行；重采样与染色是纯 CG /
+    /// 像素操作，放后台队列，完成后回主线程一次性写入缓存。
+    public func preheat(paths: [String], mode: IconColorMode) {
+        let missing = paths.filter { cache.value(for: $0) == nil }
+        guard !missing.isEmpty else { return }
+        Task.detached(priority: .utility) { [weak self] in
+            let sources: [(String, NSImage)] = await MainActor.run {
+                missing.map { ($0, NSWorkspace.shared.icon(forFile: $0)) }
+            }
+            let resampled: [(String, NSImage)] = sources.map { path, image in
+                (path, Self.resampledIcon(from: image))
+            }
+            var tinted: [String: NSImage] = [:]
+            if let tintTarget = mode.tintTarget {
+                let color = Self.nsColor(for: tintTarget)
+                for (path, image) in resampled {
+                    if let tintedIcon = Self.monochromeTint(source: image, color: color) {
+                        tinted["\(path)|\(mode.rawValue)"] = tintedIcon
+                    }
+                }
+            }
+            await MainActor.run {
+                guard let self else { return }
+                for (path, image) in resampled {
+                    self.cache.insert(image, for: path)
+                }
+                for (key, image) in tinted {
+                    self.tintedCache.insert(image, for: key)
+                }
+            }
+        }
+    }
+
     /// 缓存位图的像素缩放：Retina 2x（网格最大图标 130pt → 260px，见 GridMetrics.baseIconSize）。
     nonisolated private static let pixelScale: CGFloat = 2
 
     /// 以图片自身尺寸为准：按最大位图表示的真实像素宽高比归一，最长边 128pt。
     /// （不能直接设成正方形，否则非正方形图标会被拉变形。）
-    private static func displaySize(of image: NSImage) -> NSSize {
+    nonisolated private static func displaySize(of image: NSImage) -> NSSize {
         let target: CGFloat = 128
         guard let rep = image.representations.max(by: {
             max($0.pixelsWide, $0.pixelsHigh) < max($1.pixelsWide, $1.pixelsHigh)
@@ -61,7 +99,8 @@ public final class AppIconRepository {
 
     /// 位图级重采样：挑最大位图表示真正缩到显示像素尺寸，位图与显示尺寸一致后
     /// 合成器不再处理大纹理。非位图表示（如 PDF）退回旧路径（只设显示尺寸）。
-    private static func resampledIcon(from source: NSImage) -> NSImage {
+    /// 纯 CGContext 位图操作，后台预热与主线程渲染共用。
+    nonisolated private static func resampledIcon(from source: NSImage) -> NSImage {
         let displaySize = Self.displaySize(of: source)
         let pixelWidth = max(Int((displaySize.width * pixelScale).rounded()), 1)
         let pixelHeight = max(Int((displaySize.height * pixelScale).rounded()), 1)
@@ -74,12 +113,43 @@ public final class AppIconRepository {
                 bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
               ) else {
+            // PERF-EXP: IconServices 后备（macOS 26 NSISIconImageRep 无位图表示）也栅格化，
+            // 产出 CGImage 后备 NSImage，避免逐帧 IS→CGImage 提取 + locale 解析
+            return rasterizedFallback(source, displaySize: displaySize,
+                                      pixelWidth: pixelWidth, pixelHeight: pixelHeight)
+        }
+        context.interpolationQuality = .high
+        context.draw(cgSource, in: CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
+        guard let output = context.makeImage() else {
+            let fallback = source.copy() as! NSImage
+            fallback.size = displaySize
+            return fallback
+        }
+        return NSImage(cgImage: output, size: displaySize)
+    }
+
+    /// 把无位图表示的源图标绘制进目标位图上下文，产出 CGImage 后备 NSImage。
+    nonisolated private static func rasterizedFallback(
+        _ source: NSImage, displaySize: NSSize, pixelWidth: Int, pixelHeight: Int
+    ) -> NSImage {
+        guard let context = CGContext(
+            data: nil, width: pixelWidth, height: pixelHeight,
+            bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
             let fallback = source.copy() as! NSImage
             fallback.size = displaySize
             return fallback
         }
         context.interpolationQuality = .high
-        context.draw(cgSource, in: CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
+        NSGraphicsContext.saveGraphicsState()
+        let graphicsContext = NSGraphicsContext(cgContext: context, flipped: false)
+        NSGraphicsContext.current = graphicsContext
+        source.draw(
+            in: NSRect(x: 0, y: 0, width: CGFloat(pixelWidth), height: CGFloat(pixelHeight)),
+            from: .zero, operation: .copy, fraction: 1.0
+        )
+        NSGraphicsContext.restoreGraphicsState()
         guard let output = context.makeImage() else {
             let fallback = source.copy() as! NSImage
             fallback.size = displaySize
@@ -92,21 +162,25 @@ public final class AppIconRepository {
     /// 先压成模板（按亮度生成 alpha），再以目标色填充。
     public func tintedIcon(forPath path: String, mode: IconColorMode) -> NSImage? {
         guard mode != .original else { return nil }
-        let target: NSColor
-        switch mode {
-        case .original:
-            return nil
-        case .whiteToRed:
-            target = .white
-        case .redToWhite:
-            target = NSColor(red: 0xF1 / 255.0, green: 0x38 / 255.0, blue: 0x3D / 255.0, alpha: 1)
-        }
+        guard let tintTarget = mode.tintTarget else { return nil }
+        let target = Self.nsColor(for: tintTarget)
         let key = "\(path)|\(mode.rawValue)"
         if let cached = tintedCache.value(for: key) { return cached }
         let source = icon(forPath: path)
         guard let tinted = Self.monochromeTint(source: source, color: target) else { return nil }
         tintedCache.insert(tinted, for: key)
         return tinted
+    }
+
+    /// 染色目标 → NSColor（与 `IconTintTarget` 一一对应）。
+    nonisolated static func nsColor(for target: IconTintTarget) -> NSColor {
+        switch target {
+        case .white:
+            return .white
+        case .themeRed:
+            let c = IconTintTarget.themeRedComponents
+            return NSColor(red: c.red, green: c.green, blue: c.blue, alpha: 1)
+        }
     }
 
     /// 把图像压成单色剪影：亮度 → alpha 生成白色蒙版，再以指定色填充。

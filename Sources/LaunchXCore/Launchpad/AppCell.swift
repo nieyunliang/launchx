@@ -11,6 +11,20 @@ struct ItemFramePreferenceKey: PreferenceKey {
     }
 }
 
+/// cell frame 上报开关：只有分页网格区开启（frame 的唯一消费者是橡皮筋框选）。
+/// scroll 模式下 LazyVStack 每物化/释放一行 cell 都会触发 preference 全量聚合，
+/// 并把内容根的 `itemFrames` @State 重写 → 整树重算，是滚动掉帧的来源之一。
+private struct ItemFrameReportingKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var itemFrameReportingEnabled: Bool {
+        get { self[ItemFrameReportingKey.self] }
+        set { self[ItemFrameReportingKey.self] = newValue }
+    }
+}
+
 // MARK: - 修饰键归一化
 
 /// 交互修饰键归一化（P3-1）。
@@ -38,6 +52,37 @@ enum InteractionModifiers {
     }
 }
 
+// MARK: - 点击弹簧反馈
+
+/// 点击图标的轻微弹簧回弹：先小幅缩小（按压感），再用轻弹跳弹簧回位，
+/// 一次性微过冲后稳住。scaleEffect 是纯渲染变换不触发布局
+/// （同 LaunchpadContentView 的内容缩放）。「减弱动态效果」开启时不挂动画（P3-3）。
+private struct ClickSpringEffect: ViewModifier {
+    /// 递增触发新一轮关键帧动画。
+    let trigger: Int
+    let disabled: Bool
+
+    func body(content: Content) -> some View {
+        if disabled {
+            content
+        } else {
+            content.keyframeAnimator(
+                initialValue: 1.0,
+                trigger: trigger
+            ) { view, scale in
+                view.scaleEffect(scale)
+            } keyframes: { _ in
+                KeyframeTrack(\.self) {
+                    // 按压阶段：快且短
+                    CubicKeyframe(0.92, duration: 0.1)
+                    // 回位阶段：轻弹跳，一次性微过冲
+                    SpringKeyframe(1.0, duration: 0.4, spring: .bouncy(duration: 0.3, extraBounce: 0.1))
+                }
+            }
+        }
+    }
+}
+
 // MARK: - AppCell
 
 /// 应用单元格：图标 + 名称 + NEW/隐藏/选中角标；点击启动；⌘ 点选；拖拽源；
@@ -45,6 +90,8 @@ enum InteractionModifiers {
 struct AppCell: View {
     @Environment(LaunchpadModel.self) private var model
     @Environment(\.gridMetrics) private var metrics
+    /// 框选坐标上报开关（仅分页网格区开启，见 ItemFrameReportingKey）。
+    @Environment(\.itemFrameReportingEnabled) private var itemFrameReportingEnabled
     let app: AppRecord
     let pageIndex: Int
     /// 所在文件夹（nil = 直接摆放在页上）。
@@ -53,6 +100,9 @@ struct AppCell: View {
     let isSearchResult: Bool
     /// 键盘导航焦点（P3-4）：仅用于显示焦点环，不改变点击/启动语义。
     var isKeyboardFocused: Bool = false
+    /// 点击弹簧回弹的触发计数（递增一次播放一轮）。
+    @State private var springTrigger = 0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(spacing: 7) {
@@ -65,22 +115,26 @@ struct AppCell: View {
                     .shadow(color: .black.opacity(0.8), radius: 1.5, y: 1)
                     .lineLimit(1)
                     .truncationMode(.middle)
-                    // 名称不撑满格宽：点击热区跟随内容自然宽度
+                    // 热区挂在截断 frame 之前的文本自身边界上：maxWidth 弹性 frame
+                    // 会撑满格宽，手势挂在外面会让短名称两侧空白也可点
+                    .contentShape(Rectangle())
                     .frame(maxWidth: metrics.cellWidth - 4)
+                    .onTapGesture { handleTap() }
             }
         }
         .padding(.horizontal, 2)
         .background(selectionRing)
         // 键盘焦点环：与「选中」环区分（选中是填充色块，焦点是亮色描边）。
         .overlay { keyboardFocusRing }
-        // 点击热区只覆盖图标+名称的可见内容，不吃满整个格子；
-        // 格子其余空白落回页面背景手势（收起选区/关文件夹）
+        // 点击热区只覆盖图标/名称可见内容（手势挂在 iconArea 与 Text 上），
+        // 格子空白落回页面背景手势（收起选区/关文件夹）；
+        // 右键菜单与拖放落点仍覆盖整格，保持宽容。
         .contentShape(Rectangle())
-        .onTapGesture { handleTap() }
         .contextMenu { menuItems }
         .modifier(
             DragSourceModifier(
                 appID: app.id,
+                isEnabled: !isSearchResult,
                 // 多选时拖选中项 = 拖全部选中（按页内视觉顺序）；拖未选中项 = 单拖自身
                 selectionIDs: isSearchResult || !model.selectedAppIDs.contains(app.id)
                     ? []
@@ -90,23 +144,27 @@ struct AppCell: View {
         // 手势之后才撑满格宽：布局居中不变，热区/选中环跟随内容
         .frame(maxWidth: .infinity)
         .opacity(app.hidden ? 0.55 : 1)
-        .onDrop(
-            of: [DragPayload.type],
-            delegate: AppDropDelegate(
-                model: model,
-                pageIndex: pageIndex,
-                folderID: folderID,
-                targetAppID: app.id,
-                isFolderTarget: false,
-                folderTargetID: nil
+        .modifier(
+            AppDropTargetModifier(
+                isEnabled: !isSearchResult,
+                delegate: AppDropDelegate(
+                    model: model,
+                    pageIndex: pageIndex,
+                    folderID: folderID,
+                    targetAppID: app.id,
+                    isFolderTarget: false,
+                    folderTargetID: nil
+                )
             )
         )
         .overlay {
-            GeometryReader { proxy in
-                Color.clear.preference(
-                    key: ItemFramePreferenceKey.self,
-                    value: [app.id: proxy.frame(in: .named("pageSpace"))]
-                )
+            if itemFrameReportingEnabled {
+                GeometryReader { proxy in
+                    Color.clear.preference(
+                        key: ItemFramePreferenceKey.self,
+                        value: [app.id: proxy.frame(in: .named("pageSpace"))]
+                    )
+                }
             }
         }
     }
@@ -123,14 +181,18 @@ struct AppCell: View {
             .resizable()
             .aspectRatio(contentMode: .fit)
             .frame(width: metrics.iconSize, height: metrics.iconSize)
+            // 点击热区=图标绘制区：外圈 4pt 留白不算热区，落回页面背景手势
+            .contentShape(Rectangle())
             .frame(width: metrics.iconSize + 8, height: metrics.iconSize + 8)
-        .overlay {
-            // 放置悬停高亮：拖到该应用上将建文件夹
-            if case let .onApp(_, hoverAppID) = model.hoverTarget, hoverAppID == app.id {
-                RoundedRectangle(cornerRadius: metrics.cornerRadius + 2, style: .continuous)
-                    .strokeBorder(LXColors.accent, lineWidth: 2)
+            .modifier(ClickSpringEffect(trigger: springTrigger, disabled: reduceMotion))
+            .overlay {
+                // 放置悬停高亮：拖到该应用上将建文件夹
+                if case let .onApp(_, hoverAppID) = model.hoverTarget, hoverAppID == app.id {
+                    RoundedRectangle(cornerRadius: metrics.cornerRadius + 2, style: .continuous)
+                        .strokeBorder(LXColors.accent, lineWidth: 2)
+                }
             }
-        }
+            .onTapGesture { handleTap() }
     }
 
     // MARK: 角标
@@ -174,12 +236,19 @@ struct AppCell: View {
     // MARK: 交互
 
     private func handleTap() {
+        playSpring()
         // Caps Lock / 数字键盘等标志位不能影响「⌘ 点击 = 多选」（P3-1）。
         if InteractionModifiers.hasCommand(NSEvent.modifierFlags), !isSearchResult {
             model.toggleSelection(appID: app.id)
         } else {
             model.launch(appID: app.id)
         }
+    }
+
+    /// 播放点击弹簧回弹；「减弱动态效果」开启时静默跳过。
+    private func playSpring() {
+        guard !reduceMotion else { return }
+        springTrigger += 1
     }
 
     @ViewBuilder private var keyboardFocusRing: some View {
@@ -259,14 +328,35 @@ struct AppCell: View {
 /// 单/多选拖拽源；`selectionIDs` 为按页内视觉顺序排好的多选载荷（空 = 单拖当前项）。
 struct DragSourceModifier: ViewModifier {
     let appID: String
+    /// 搜索结果等只读界面不挂拖拽源。
+    var isEnabled = true
     let selectionIDs: [String]
 
     func body(content: Content) -> some View {
-        content.onDrag {
-            let ids = selectionIDs.isEmpty ? [appID] : selectionIDs
-            // 每次拖拽开启新会话：载荷里带上会话 id，drop 时校验，旧会话的载荷会被拒绝。
-            let sessionID = DragObserver.shared.beginDrag(ids: ids)
-            return DragPayload.provider(ids, sessionID: sessionID)
+        if isEnabled {
+            content.onDrag {
+                let ids = selectionIDs.isEmpty ? [appID] : selectionIDs
+                // 每次拖拽开启新会话：载荷里带上会话 id，drop 时校验，旧会话的载荷会被拒绝。
+                let sessionID = DragObserver.shared.beginDrag(ids: ids)
+                return DragPayload.provider(ids, sessionID: sessionID)
+            }
+        } else {
+            content
+        }
+    }
+}
+
+/// 放置目标开关：搜索结果界面是只读的，不挂 drop target
+/// （否则从搜索结果里拖一下就会静默建文件夹 / 把应用改写进第 1 页）。
+struct AppDropTargetModifier: ViewModifier {
+    let isEnabled: Bool
+    let delegate: AppDropDelegate
+
+    func body(content: Content) -> some View {
+        if isEnabled {
+            content.onDrop(of: [DragPayload.type], delegate: delegate)
+        } else {
+            content
         }
     }
 }

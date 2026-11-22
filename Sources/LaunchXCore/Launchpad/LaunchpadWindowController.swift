@@ -63,7 +63,20 @@ struct InteractivePageGesture {
     /// 滚动事件是否上报给翻页手势（面板层过滤规则）。
     /// 相位边界事件（.began/.ended）必须无条件上报：.ended 的滚动增量通常为 0，
     /// 若按幅度过滤会永远丢失"松手"信号，导致无法落位。
-    static func shouldForward(deltaX: CGFloat, deltaY: CGFloat, isGestureBoundary: Bool) -> Bool {
+    /// 分页浏览下连续手势（phase / momentumPhase 非空）全部上报：该过滤不知道
+    /// 跟手是否已在进行，逐事件丢弃小增量（触控板高采样率下慢滑常只有 1-2pt）
+    /// 与纵向为主的抖动事件，会让 1:1 跟手退化成断续位移（不丝滑的主因）；
+    /// 惯性与离散事件在 `feed` 里有各自的过滤语义，全部上报无副作用。
+    /// 非分页浏览（滚动模式 / 搜索 / 文件夹）保持方向与幅度过滤：
+    /// 纵向滚动事件必须放行给内层 ScrollView。
+    static func shouldForward(
+        deltaX: CGFloat,
+        deltaY: CGFloat,
+        isGestureBoundary: Bool,
+        isContinuousGesture: Bool = false,
+        isPagedBrowsing: Bool = false
+    ) -> Bool {
+        if isPagedBrowsing, isContinuousGesture { return true }
         if isGestureBoundary { return true }
         return abs(deltaX) > abs(deltaY) && abs(deltaX) > 2
     }
@@ -166,6 +179,9 @@ final class PanelKeyHandlers: @unchecked Sendable {
     var onArrowDown: () -> Void = {}
     var onPrintableKey: (String) -> Void = { _ in }
     var onPageScroll: (PageScrollEvent) -> Void = { _ in }
+    /// 当前是否处于「横滑翻页生效」状态（分页浏览且非搜索 / 文件夹态）。
+    /// 面板层据此决定连续手势事件是否全部上报：见 `InteractivePageGesture.shouldForward`。
+    var isPagedBrowsing: () -> Bool = { false }
     /// Tab / Shift-Tab：在网格应用之间移动键盘焦点（P3-4）。
     var onTab: (Bool) -> Void = { _ in }
     /// Return / 小键盘 Enter：启动（或打开）当前键盘焦点项。
@@ -198,6 +214,53 @@ enum EscapeKeyRouter {
         let base = action(isComposingText: isComposingText, searchQuery: searchQuery)
         if base == .background, hasGridFocus { return .dismissGridFocus }
         return base
+    }
+}
+
+/// 搜索框聚焦时的键盘路由（纯逻辑，便于单测）。
+///
+/// 搜索框获得焦点后，单行 field editor（`NSTextView`）会把方向键、Tab 消费在自己的
+/// 编辑命令里，事件不再冒泡到面板 `keyDown`——于是 `searchSelectedIndex` 永远停在 0，
+/// 高亮环不动、回车只能启动第一条。窗口控制器用本地事件监听在派发前按此表接管。
+enum SearchFieldKeyRouter {
+    enum Action: Equatable {
+        /// 不拦截：交给 field editor 正常处理。
+        case passThrough
+        /// 移动搜索结果高亮。
+        case moveSelection(Int)
+        /// 启动当前高亮结果。
+        case activate
+        /// 搜索词为空时按 Tab：退出搜索框、把键盘焦点交回网格。
+        case focusGrid(shifted: Bool)
+    }
+
+    static func action(
+        keyCode: UInt16,
+        hasMarkedText: Bool,
+        searchQuery: String,
+        hitCount: Int,
+        selectedIndex: Int,
+        shiftPressed: Bool
+    ) -> Action {
+        // 输入法组字中：方向键用于选候选词、回车用于上屏，绝不拦截
+        guard !hasMarkedText else { return .passThrough }
+        switch keyCode {
+        case 126:  // ↑
+            guard !searchQuery.isEmpty, hitCount > 0 else { return .passThrough }
+            // 两个方向都钳到有效范围：陈旧下标（结果集刚变小）不能让它停在范围外。
+            return .moveSelection(min(max(selectedIndex - 1, 0), hitCount - 1))
+        case 125:  // ↓
+            guard !searchQuery.isEmpty, hitCount > 0 else { return .passThrough }
+            return .moveSelection(min(max(selectedIndex, 0) + 1, hitCount - 1))
+        case 36, 76:  // Return / 小键盘 Enter
+            guard !searchQuery.isEmpty, hitCount > 0 else { return .passThrough }
+            return .activate
+        case 48:  // Tab / Shift-Tab
+            guard searchQuery.isEmpty else { return .passThrough }
+            return .focusGrid(shifted: shiftPressed)
+        default:
+            return .passThrough
+        }
     }
 }
 
@@ -288,7 +351,14 @@ final class AlwaysKeyPanel: NSPanel {
             // 由窗口控制器驱动页面跟手偏移与松手落位
             let deltaX = event.scrollingDeltaX
             let isBoundary = event.phase == .began || event.phase == .ended
-            if InteractivePageGesture.shouldForward(deltaX: deltaX, deltaY: event.scrollingDeltaY, isGestureBoundary: isBoundary) {
+            let isContinuous = event.phase != [] || event.momentumPhase != []
+            if InteractivePageGesture.shouldForward(
+                deltaX: deltaX,
+                deltaY: event.scrollingDeltaY,
+                isGestureBoundary: isBoundary,
+                isContinuousGesture: isContinuous,
+                isPagedBrowsing: keyHandlers.isPagedBrowsing()
+            ) {
                 keyHandlers.onPageScroll(PageScrollEvent(
                     delta: deltaX,
                     isGestureStart: event.phase == .began,
@@ -533,6 +603,21 @@ enum ScreenPick {
 @MainActor
 public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
 
+    /// 启动台面板是全屏 `.statusBar` 层级。从面板打开的子窗口（设置 / 整理布局 / 卸载）
+    /// 若用普通层级会被完全盖住——表现为「点了没反应」，且键盘焦点落在一个看不见的窗口里。
+    /// 面板可见时子窗口抬到面板之上；面板收起后子窗口回落普通层级。
+    public static let overlayChildWindowLevel = NSWindow.Level(
+        rawValue: NSWindow.Level.statusBar.rawValue + 1
+    )
+
+    /// 面板当前是否在屏（show/hide 路径维护）。
+    public private(set) static var isOverlayOnScreen = false
+
+    /// 子窗口打开时应使用的层级。
+    public static var childWindowLevel: NSWindow.Level {
+        isOverlayOnScreen ? overlayChildWindowLevel : .normal
+    }
+
     public let model: LaunchpadModel
 
     private var panel: AlwaysKeyPanel?
@@ -543,8 +628,10 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
     /// 防止过期的 show 回调把刚收起的面板复活（.isVisible 翻回 true）。
     private var showTickGeneration = 0
     private var pageGesture = InteractivePageGesture()
-    /// 当前跟手方向：true = 张开展开，false = 捏合收起；nil = 无进行中的手势。
-    private var pinchOpening: Bool?
+    /// 当前跟手会话起点面板是否展开；nil = 无进行中的手势。
+    /// 会话中途可反向（不抬手捏合后再张开）：视觉由「起点 + 有符号进度」驱动、
+    /// 落位只看终帧方向，不冻结会话起始方向。
+    private var pinchStartVisible: Bool?
     /// 网格键盘焦点（P3-4）：与内容视图共享，方向键/Tab/Return 由控制器驱动。
     private let gridFocus = GridKeyboardFocus()
     private var pageIdleSettleWork: DispatchWorkItem?
@@ -562,6 +649,8 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
     private var hasNotifiedWallpaperPermission = false
     /// 收起动画 + orderOut 延迟期间为 true（窗口此时仍然 isVisible）。
     private var isHiding = false
+    /// 搜索框聚焦时的键盘本地监听（field editor 会吞掉面板 keyDown）。
+    private var searchFieldKeyMonitor: Any?
 
     public init(model: LaunchpadModel) {
         self.model = model
@@ -641,6 +730,7 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
         panel?.ignoresMouseEvents = !model.isVisible
         panel?.orderFrontRegardless()
         panel?.makeKey()
+        Self.isOverlayOnScreen = true
         installAutoHideMonitors()
     }
 
@@ -651,6 +741,7 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
             guard let self else { return }
             self.panel?.orderOut(nil)
             self.isHiding = false
+            LaunchpadWindowController.isOverlayOnScreen = false
             try? self.model.store.saveNow()
         }
         hideWorkItem = work
@@ -662,30 +753,36 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
 
     // MARK: - 捏合展开 / 收起（逐帧跟手）
 
-    /// 张开只负责展开、捏合只负责收起；反方向手势不改变当前窗口状态。
+    /// 张开负责展开、捏合负责收起；已展开时继续张开 / 已收起时继续捏合不开启会话。
+    /// 会话中途不抬手反向（捏合后再张开）由有符号进度自然接管：视觉 = 起点可见性
+    /// + 有符号进度，方向在过零处连续翻转，不按起始方向冻结映射。
+    /// 事件来源是原始触点识别器（TrackpadTouchMonitor）：滑动噪声在识别器层
+    /// 已被位移否决拦下，窗口层恢复完整跟手，无需延迟提交类防御。
     public func handlePinchGesture(_ event: PinchGestureEvent) {
         switch event.phase {
         case .began:
-            // 上一手势若缺少终帧，先回退，避免新会话继承半透明状态。
-            if pinchOpening != nil {
-                settlePinchGesture(commit: false, animated: false)
+            // 上一手势若缺少终帧，先回退，避免新会话继承半途的视觉状态。
+            if pinchStartVisible != nil {
+                settlePinchGesture(finalProgress: nil, cancelled: true, animated: false)
             }
         case .changed:
-            if pinchOpening == nil {
+            if pinchStartVisible == nil {
                 guard event.signedProgress != 0 else { return }
                 let opening = event.signedProgress > 0
-                // 已展开时忽略继续张开，已收起时忽略继续捏合。
+                // 只约束会话起点：已展开时忽略继续张开、已收起时忽略继续捏合
+                // （收起淡出中的捏合同样放行收起，不得借机复活面板）。
                 guard opening != model.isVisible else { return }
-                beginPinchGesture(opening: opening)
+                beginPinchGesture()
             }
-            model.pinchTransitionProgress = min(max(abs(event.signedProgress), 0), 1)
+            model.pinchTransitionProgress = Self.pinchVisualProgress(
+                startVisible: pinchStartVisible == true, signedProgress: event.signedProgress
+            )
         case .ended:
-            guard pinchOpening != nil else { return }
-            let commit = Self.shouldCommitPinch(progress: event.signedProgress, cancelled: false)
-            settlePinchGesture(commit: commit)
+            guard pinchStartVisible != nil else { return }
+            settlePinchGesture(finalProgress: event.signedProgress, cancelled: false)
         case .cancelled:
-            guard pinchOpening != nil else { return }
-            settlePinchGesture(commit: false)
+            guard pinchStartVisible != nil else { return }
+            settlePinchGesture(finalProgress: nil, cancelled: true)
         }
     }
 
@@ -693,16 +790,25 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
         !cancelled && abs(progress) >= 0.5
     }
 
-    private func beginPinchGesture(opening: Bool) {
+    /// 会话内视觉过渡进度（0=收起，1=展开，与内容视图 transitionProgress 同口径）：
+    /// 起点（会话开始时的可见性）+ 有符号进度，钳制到 0...1。有符号进度以零为中心
+    /// （张开为正、捏合为负），反向过零天然连续——不抬手「捏合后再张开」跟手不跳变。
+    /// 回归：冻结起始方向的旧映射在反向后先弹回起点端再反向滑（闪烁），且终帧为
+    /// 张开时也会误判成收起落位；更早的实现甚至把收起会话识别瞬间置 0（闪烁后关闭）。
+    nonisolated static func pinchVisualProgress(startVisible: Bool, signedProgress: Double) -> Double {
+        let start: Double = startVisible ? 1 : 0
+        return min(max(start + signedProgress, 0), 1)
+    }
+
+    private func beginPinchGesture() {
         showTickGeneration += 1
         closeWorkItem?.cancel()
         hideWorkItem?.cancel()
         wallpaperRefreshWork?.cancel()
         wallpaperRefreshWork = nil
         removeAutoHideMonitors()
-        pinchOpening = opening
-        model.pinchTransitionProgress = 0
-        if opening {
+        pinchStartVisible = model.isVisible
+        if !model.isVisible {
             prepareForShowing()
             // isVisible 表示逻辑会话已开始；视觉仍完全由 pinchTransitionProgress 驱动。
             model.show()
@@ -715,12 +821,15 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
     }
 
     /// 松手后从当前表现值继续弹簧落位，不重新播放完整动画。
-    private func settlePinchGesture(commit: Bool, animated: Bool = true) {
-        guard let opening = pinchOpening else { return }
-        let shouldRemainVisible = opening == commit
+    /// |终帧进度| ≥ 0.5 按终帧方向落位（张开 → 展开、捏合 → 收起）——会话中途反向后，
+    /// 终帧方向即用户最终意图；未过半或系统取消回退到会话起点的可见性。
+    private func settlePinchGesture(finalProgress: CGFloat?, cancelled: Bool, animated: Bool = true) {
+        guard let startVisible = pinchStartVisible else { return }
+        let commit = Self.shouldCommitPinch(progress: finalProgress ?? 0, cancelled: cancelled)
+        let targetVisible = commit ? (finalProgress ?? 0) > 0 : startVisible
         let update = {
             self.model.pinchTransitionProgress = nil
-            if shouldRemainVisible {
+            if targetVisible {
                 if !self.model.isVisible { self.model.show() }
             } else {
                 self.model.hide()
@@ -731,9 +840,9 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
         } else {
             update()
         }
-        pinchOpening = nil
+        pinchStartVisible = nil
 
-        if shouldRemainVisible {
+        if targetVisible {
             hideWorkItem?.cancel()
             panel?.ignoresMouseEvents = false
             installAutoHideMonitors()
@@ -750,7 +859,7 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
 
     /// 快捷键、Esc 等非手势入口接管时，清掉实时进度但保留当前逻辑可见性。
     private func resetPinchInteraction() {
-        pinchOpening = nil
+        pinchStartVisible = nil
         model.pinchTransitionProgress = nil
     }
 
@@ -795,7 +904,60 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
         hostingView = hosting
         self.panel = panel
         installKeyHandlers(on: panel)
+        installSearchFieldKeyMonitor()
         return screen
+    }
+
+    /// 搜索框聚焦后，↑↓ / 回车 / Tab 被 field editor 消费，不再走面板 `keyDown`，
+    /// 搜索结果键盘选择因此是死代码。这里用本地事件监听在派发前接管这些按键，
+    /// 转发到与面板相同的一套路由（仅限面板 key window 且搜索框 field editor 聚焦时）。
+    private func installSearchFieldKeyMonitor() {
+        guard searchFieldKeyMonitor == nil else { return }
+        searchFieldKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            // 只把 Sendable 的标量带进主线程闭包（NSEvent 不是 Sendable）
+            let keyCode = event.keyCode
+            let shiftPressed = InteractionModifiers.normalized(event.modifierFlags).contains(.shift)
+            let consumed = MainActor.assumeIsolated { [weak self] in
+                self?.handleSearchFieldKey(keyCode: keyCode, shiftPressed: shiftPressed) ?? false
+            }
+            return consumed ? nil : event
+        }
+    }
+
+    /// 返回 true 表示消费该按键（不再派发给 field editor）。
+    private func handleSearchFieldKey(keyCode: UInt16, shiftPressed: Bool) -> Bool {
+        guard model.isVisible, !isHiding, let panel, panel.isKeyWindow else { return false }
+        guard let fieldEditor = panel.firstResponder as? NSTextView,
+              fieldEditor.isFieldEditor else { return false }
+        // 组字状态采样：本监听器在事件派发「前」运行，此刻 hasMarkedText 还是
+        // 上一次的状态，等事件送达 field editor 后再读才是本次按键的结果。
+        DispatchQueue.main.async { [weak self] in
+            self?.model.searchIsComposing = fieldEditor.hasMarkedText()
+        }
+        let action = SearchFieldKeyRouter.action(
+            keyCode: keyCode,
+            hasMarkedText: fieldEditor.hasMarkedText(),
+            searchQuery: model.searchQuery,
+            hitCount: model.searchHits.count,
+            selectedIndex: model.searchSelectedIndex,
+            shiftPressed: shiftPressed
+        )
+        switch action {
+        case .passThrough:
+            return false
+        case let .moveSelection(index):
+            model.searchSelectedIndex = index
+            return true
+        case .activate:
+            activateFocusedItem()
+            return true
+        case let .focusGrid(shifted):
+            // 先让搜索框失焦（视图侧监听令牌），再把键盘焦点交回网格
+            model.searchBlurTrigger += 1
+            model.searchIsComposing = false  // 失焦即不在组字，占位恢复显示
+            handleTab(shiftedBy: shifted)
+            return true
+        }
     }
 
     /// 装配面板键盘 / 滚轮路由。
@@ -820,6 +982,14 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
         handlers.onPageScroll = { [weak self] event in
             self?.handlePageScroll(event)
         }
+        // 与 handlePageScroll 的 guard 保持同一判定：这些状态下事件不参与横滑，
+        // 保持方向过滤让纵向滚动（搜索结果 / 文件夹成员列表）进入内层 ScrollView。
+        handlers.isPagedBrowsing = { [weak self] in
+            guard let self else { return false }
+            return self.model.settings.browsingStyle == .paged
+                && self.model.searchQuery.isEmpty
+                && !self.model.isFolderViewActive
+        }
     }
 
     /// Esc 分层：组字中交给输入法；搜索词非空先清空搜索词；否则按空白点击语义
@@ -831,7 +1001,7 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
             isComposingText: composing,
             searchQuery: model.searchQuery,
             // 文件夹打开时优先关文件夹（既有分层），焦点层让位
-            hasGridFocus: gridFocus.focusedIndex != nil && model.openedFolder == nil
+            hasGridFocus: gridFocus.focusedIndex != nil && !model.isFolderViewActive
         ) {
         case .passThrough:
             return
@@ -850,7 +1020,12 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
     /// 聚焦是异步的，先写查询才不会丢掉首个字符；聚焦生效后按键由 field editor
     /// 处理，不再经面板 keyDown，因此不会重复插入。
     private func handleTypeToSearch(_ characters: String) {
-        model.searchQuery += characters
+        // IME（中文/日文等）激活时首键不是用户想输入的字符：直接写进查询会得到
+        // 「字面首字母 + 之后提交的中文」，例如打「微信」却搜「w微信」。
+        // 此时只聚焦搜索框，让输入法从下一键开始正常组字（放弃这个原始字母）。
+        if InputSource.isASCIICapable {
+            model.searchQuery += characters
+        }
         model.searchFocusTrigger += 1
     }
 
@@ -860,19 +1035,19 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
     /// 有焦点时方向键只移动焦点，不会与翻页叠加；无焦点时维持原 ←→ 翻页语义。
     private func handleArrow(_ direction: GridFocusNavigator.Direction) {
         if !model.searchQuery.isEmpty {
+            let hits = model.searchHits
+            guard !hits.isEmpty else { return }
             switch direction {
             case .up:
-                model.searchSelectedIndex = max(model.searchSelectedIndex - 1, 0)
+                model.searchSelectedIndex = min(max(model.searchSelectedIndex - 1, 0), hits.count - 1)
             case .down:
-                let hits = model.searchHits
-                guard !hits.isEmpty else { return }
                 model.searchSelectedIndex = min(model.searchSelectedIndex + 1, hits.count - 1)
             case .left, .right, .next, .previous:
                 break
             }
             return
         }
-        guard model.openedFolder == nil else { return }
+        guard !model.isFolderViewActive else { return }
 
         if gridFocus.focusedIndex != nil {
             moveGridFocus(direction)
@@ -891,12 +1066,15 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
 
     /// Tab / Shift-Tab：进入网格焦点或在应用之间移动。
     private func handleTab(shiftedBy shifted: Bool) {
-        guard model.searchQuery.isEmpty, model.openedFolder == nil else { return }
+        guard model.searchQuery.isEmpty, !model.isFolderViewActive else { return }
         moveGridFocus(shifted ? .previous : .next)
     }
 
     @discardableResult
     private func moveGridFocus(_ direction: GridFocusNavigator.Direction) -> Bool {
+        // 滚动模式不画焦点环（没有「当前页」概念，也不渲染 focusedSlot）：
+        // 允许键盘移动焦点只会产生「看不见的选中」，回车还会启动用户没看到的应用。
+        guard model.settings.browsingStyle == .paged else { return false }
         let items = currentPageItems
         guard !items.isEmpty else {
             gridFocus.clear()
@@ -926,7 +1104,7 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
     /// 焦点走到行首/行尾时翻页，并把焦点落到新页的第一个/最后一个格位。
     private func turnPageForGridFocus(forward: Bool) -> Bool {
         guard model.settings.browsingStyle == .paged,
-              model.openedFolder == nil,
+              !model.isFolderViewActive,
               model.searchQuery.isEmpty,
               PageSettleGuard.allowsNavigation(isSettlingPageDrag: model.isSettlingPageDrag) else { return true }
         let target = model.currentPage + (forward ? 1 : -1)
@@ -945,11 +1123,12 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
         if !model.searchQuery.isEmpty {
             let hits = model.searchHits
             guard !hits.isEmpty else { return }
-            let index = min(max(model.searchSelectedIndex, 0), hits.count - 1)
+            let index = model.clampedSearchSelectedIndex
             model.launch(appID: hits[index].appID)
             return
         }
-        guard model.openedFolder == nil,
+        guard model.settings.browsingStyle == .paged,
+              !model.isFolderViewActive,
               let focused = gridFocus.focusedIndex,
               gridFocus.pageIndex == model.currentPage else { return }
         let items = currentPageItems
@@ -976,7 +1155,7 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
     private func handlePageScroll(_ event: PageScrollEvent) {
         guard model.settings.browsingStyle == .paged,
               model.searchQuery.isEmpty,
-              model.openedFolder == nil else { return }
+              !model.isFolderViewActive else { return }
         // 落位动画期间：离散滚轮与惯性事件照旧不参与（等落位收尾）；
         // 新手势开始则按动画曲线解析表现值无缝接管跟手（消除落位期输入死窗）
         var resumingFrom: CGFloat?
@@ -1035,7 +1214,9 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
         let screens = NSScreen.screens
         switch position {
         case .main:
-            return NSScreen.main ?? screens.first ?? NSScreen()
+            // 主显示器 = 原点在 (0,0) 的那块屏。NSScreen.main 的语义是「当前 key window
+            // 所在屏」，多屏下会让「主屏幕」退化成「当前激活屏」。
+            return screens.first { $0.frame.origin == .zero } ?? screens.first ?? NSScreen()
         case .active:
             // 「当前激活屏幕」：
             // 1) 有键盘焦点窗口（例如从设置/卸载窗口唤起）→ 用该窗口所在屏；

@@ -69,18 +69,41 @@ public final class LaunchpadModel {
     public var pageWidth: CGFloat = 1440
     /// 横滑落位动画进行中（期间新手势可按表现值接管，离散滚轮仍等待落位）。
     public private(set) var isSettlingPageDrag = false
+    /// 落位动画期间挂起的提交方向（+1/-1，回弹为 0）。视图层据此把提交目标页
+    /// 提前物化，原子换页帧（finishDragCommit）不再包含新页构建开销。
+    /// 收尾 / 接管 / 收起时清空。
+    public private(set) var pendingCommitDirection: Int? = nil
     /// 落位动画参数（接管时解析表现值用）；无落位动画时为 nil。
     public private(set) var pageSettleAnimation: PageSettleAnimation?
     /// 落位收尾定时器（接管时取消，避免过期收尾与接管手势双写页码）。
     private var pageSettleWork: DispatchWorkItem?
     /// 当前打开的文件夹（页下标, 文件夹 ID）。
     public var openedFolder: (page: Int, folderID: UUID)?
-    /// 搜索文本。
-    public var searchQuery: String = ""
-    /// 搜索键盘选中下标。
+    /// 搜索文本。变化即把键盘高亮归零：结果集变了以后旧下标可能越界
+    /// （高亮环消失、回车被钳到「最后一条」）。
+    public var searchQuery: String = "" {
+        didSet {
+            if searchQuery != oldValue { searchSelectedIndex = 0 }
+            // 文本一变就不是组字中（提交 / 程序化清空）；组字期间文本不变，
+            // 不会走到这里，见 searchIsComposing 注释。
+            searchIsComposing = false
+        }
+    }
+    /// 输入法组字中（field editor 有 marked text）。组字期间搜索文本不变
+    /// （binding 不更新），搜索框自绘占位需据此隐藏，避免和组字文本叠字。
+    /// 面板层 keyDown 监听器在事件送达 field editor 后采样 `hasMarkedText` 写入。
+    public var searchIsComposing = false
+    /// 搜索键盘选中下标（对外读取时用 `clampedSearchSelectedIndex`）。
     public var searchSelectedIndex: Int = 0
+
+    /// 钳到当前命中范围的下标（命中为空时为 0）。
+    public var clampedSearchSelectedIndex: Int {
+        min(max(searchSelectedIndex, 0), max(searchHits.count - 1, 0))
+    }
     /// 触发搜索框聚焦的令牌（面板层捕获可打印按键时 +1，视图 onChange 聚焦）。
     public var searchFocusTrigger: Int = 0
+    /// 触发搜索框失焦的令牌（搜索框聚焦时按 Tab 要回到网格键盘焦点，视图 onChange 失焦）。
+    public var searchBlurTrigger: Int = 0
     /// ⌘ 多选集合（应用 id）。
     public var selectedAppIDs: Set<String> = []
     /// 橡皮筋选框（页面坐标空间；nil = 无框选）。
@@ -132,6 +155,7 @@ public final class LaunchpadModel {
         lastPageDirection = target >= currentPage ? .forward : .backward
         currentPage = target
         searchQuery = ""
+        searchSelectedIndex = 0
         selectedAppIDs = []
         openedFolder = nil
         marqueeRect = nil
@@ -145,6 +169,7 @@ public final class LaunchpadModel {
         // 由窗口控制器延后到淡出结束，避免阻塞收起动画的首帧。
         store.updateSettingsInMemory { $0.lastViewedPage = self.currentPage }
         searchQuery = ""
+        searchSelectedIndex = 0
         selectedAppIDs = []
         openedFolder = nil
         marqueeRect = nil
@@ -153,6 +178,7 @@ public final class LaunchpadModel {
         pageSettleWork?.cancel()
         pageSettleWork = nil
         pageSettleAnimation = nil
+        pendingCommitDirection = nil
         isSettlingPageDrag = false
         pageDragOffset = 0
         // 面板收起即视为拖拽取消（Esc / 点空白 / 失焦），立即清掉拖拽会话，
@@ -167,8 +193,13 @@ public final class LaunchpadModel {
     /// 面板空白处点击：先关文件夹 → 清多选 → 都没有则收起面板（对齐原版 Launchpad）。
     public func handleBackgroundTap() {
         if openedFolder != nil {
+            let wasActive = isFolderViewActive
             closeFolder()
-        } else if !selectedAppIDs.isEmpty {
+            // 悬空状态（文件夹已被删除/搬走）本次点击只负责清理，继续处理多选与收起，
+            // 否则用户要连点两次空白才能关掉面板。
+            if wasActive { return }
+        }
+        if !selectedAppIDs.isEmpty {
             clearSelection()
         } else {
             onDismiss?()
@@ -215,19 +246,25 @@ public final class LaunchpadModel {
             }
         }
         isSettlingPageDrag = true
-        // 动画时长（LXAnimations 常量）+ 余量：动画到位后执行收尾（模型层拿不到动画完成回调）
+        pendingCommitDirection = commitDirection
+        // 动画时长（LXAnimations 常量）+ 余量：动画到位后执行收尾（模型层拿不到动画完成回调）。
+        // 减弱动态效果时与键盘/页码点翻页保持一致：同曲线、0.12s，而不是固定 0.3s。
+        let reduce = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let profile = MotionPreference.profile(reduceMotion: reduce)
+        let slideAnimation = MotionPreference.pageSlide(reduceMotion: reduce)
+        let bounceAnimation: Animation = reduce ? .easeOut(duration: profile.pageSlideDuration) : .pageBounceBack
         let duration: TimeInterval
         let targetOffset: CGFloat
         let startOffset = pageDragOffset
         if commitDirection == 0 {
-            duration = Animation.pageBounceBackSeconds
+            duration = reduce ? profile.pageSlideDuration : Animation.pageBounceBackSeconds
             targetOffset = 0
-            withAnimation(Animation.pageBounceBack) { pageDragOffset = 0 }
+            withAnimation(bounceAnimation) { pageDragOffset = 0 }
         } else {
-            duration = Animation.pageSlideSeconds
+            duration = profile.pageSlideDuration
             targetOffset = -CGFloat(commitDirection) * width
             lastPageDirection = commitDirection > 0 ? .forward : .backward
-            withAnimation(Animation.pageSlide) {
+            withAnimation(slideAnimation) {
                 pageDragOffset = targetOffset
             }
         }
@@ -258,6 +295,7 @@ public final class LaunchpadModel {
         withTransaction(transaction) {
             currentPage = min(max(currentPage + direction, 0), pageCount - 1)
             pageDragOffset = 0
+            pendingCommitDirection = nil
         }
         isSettlingPageDrag = false
     }
@@ -270,6 +308,7 @@ public final class LaunchpadModel {
         pageSettleWork?.cancel()
         pageSettleWork = nil
         pageSettleAnimation = nil
+        pendingCommitDirection = nil
         let presentation = animation.presentationOffset(at: Date())
         var transaction = Transaction()
         transaction.disablesAnimations = true
@@ -473,12 +512,26 @@ public final class LaunchpadModel {
     // MARK: - 隐藏 / 重命名
 
     public func setHidden(_ hidden: Bool, appID: String) {
+        var appName = ""
         store.updateLayout { layout in
             guard layout.apps[appID] != nil else { return }
+            appName = layout.apps[appID]?.name ?? ""
             layout.apps[appID]?.hidden = hidden
+            // 隐藏 = 从启动台移出（只保留注册表 / 搜索）。不同时摘除摆放会让
+            // 「hidden 且 placed」长期自相矛盾：图标留在页面上（仅变暗）、拖不动、
+            // 且 resetLayout / unhide / 同步逻辑都以「隐藏项不在网格」为前提。
+            if hidden {
+                layout.detachFromGrid(appID)
+            }
         }
         if hidden {
-            ToastManager.shared.show(.info, "已隐藏「\(layout.apps[appID]?.name ?? "")」")
+            ToastManager.shared.show(.info, "已隐藏「\(appName)」")
+        }
+        if hidden, selectedAppIDs.contains(appID) {
+            selectedAppIDs.remove(appID)
+        }
+        if openedFolder != nil, openedFolderRecord == nil {
+            closeFolder()
         }
     }
 
@@ -534,6 +587,9 @@ public final class LaunchpadModel {
             store.updateLayout { layout in
                 layout.removeApp(id: appID)
             }
+            // 被移出布局的 id 不能留在选择集里（否则工具栏计数虚高、可生成单人文件夹）。
+            selectedAppIDs.remove(appID)
+            reconcileOpenedFolder()
             if app.isAlias {
                 ToastManager.shared.show(.info, "已删除替身「\(app.name)」（不影响原应用）")
             }
@@ -616,7 +672,7 @@ public final class LaunchpadModel {
             //    或从已失效的打开文件夹状态拖出），因此这里不依赖 sourceFolderID，
             //    一律把 id 从任意文件夹中摘除，避免同一应用同时出现在文件夹和页面上。
             for appID in movableIDs {
-                Self.removeAppFromAnyFolder(appID: appID, layout: &layout)
+                layout.removeAppFromAnyFolder(appID)
                 for pageIndex in layout.pages.indices {
                     layout.pages[pageIndex].items.removeAll { $0.appID == appID }
                 }
@@ -640,14 +696,16 @@ public final class LaunchpadModel {
                     layout.appendApp(id: appID, toPage: pageIndex, capacityPerPage: capacity)
                 }
 
-            case let .onApp(_, targetAppID):
-                // 单拖到应用上 → 建夹；多拖到应用上 → 每个合入
+            case let .onApp(page, targetAppID):
+                // 单拖到应用上 → 建夹；多拖到应用上 → 合入新文件夹。
+                // 文件夹必须落在「落点」页而不是 currentPage：滚动模式下 currentPage
+                // 可能未跟随可视页，用 currentPage 会让文件夹出现在别的页（用户看不到）。
                 if movableIDs.count == 1, movableIDs[0] != targetAppID {
                     FolderEngine.createFolder(dragging: movableIDs[0], onto: targetAppID, layout: &layout)
                 } else {
                     FolderEngine.mergeIntoNewFolder(
                         appIDs: movableIDs + [targetAppID],
-                        page: currentPage,
+                        page: page,
                         layout: &layout
                     )
                 }
@@ -658,24 +716,15 @@ public final class LaunchpadModel {
 
             layout.removeEmptyPages()
         }
-        selectedAppIDs.subtract(movableIDs)
-        currentPage = min(max(currentPage, 0), pageCount - 1)
-    }
-
-    /// 把应用从任意文件夹中摘除；文件夹被摘空后一并移除。
-    /// 用于拖放前清理旧位置，防止成员被复制到多处。
-    private static func removeAppFromAnyFolder(appID: String, layout: inout LayoutSnapshot) {
-        for pageIndex in layout.pages.indices {
-            guard let slotIndex = layout.pages[pageIndex].items.firstIndex(where: { $0.folder?.appIDs.contains(appID) == true }),
-                  var folder = layout.pages[pageIndex].items[slotIndex].folder
-            else { continue }
-            folder.appIDs.removeAll { $0 == appID }
-            if folder.appIDs.isEmpty {
-                layout.pages[pageIndex].items.remove(at: slotIndex)
-            } else {
-                layout.pages[pageIndex].items[slotIndex] = .folder(folder)
-            }
+        // 拖放收尾：只保留「仍直接摆放在网格上」的选择项。
+        // 被拖走 / 被合入文件夹的 id 留在选择集里会形成陈旧选择：随后点「合并到新文件夹」
+        // 会把已在文件夹里的应用再收进第二个文件夹（同一应用出现两次）。
+        selectedAppIDs = selectedAppIDs.filter { layout.pageIndexOfDirectApp($0) != nil }
+        // 打开态文件夹可能因这次拖放被摘空删除：面板必须一并关闭，否则只剩空白蒙层。
+        if openedFolder != nil, openedFolderRecord == nil {
+            closeFolder()
         }
+        currentPage = min(max(currentPage, 0), pageCount - 1)
     }
 
     /// 页超容量时把末尾项顺延到后续页。
@@ -694,12 +743,20 @@ public final class LaunchpadModel {
     // MARK: - 文件夹
 
     public func openFolder(page: Int, folderID: UUID) {
+        // 打开文件夹进入全屏子视图：网格的多选/框选不能再留在背后被工具栏操作。
+        selectedAppIDs.removeAll()
+        marqueeRect = nil
         openedFolder = (page, folderID)
     }
 
     public func closeFolder() {
         openedFolder = nil
     }
+
+    /// 文件夹视图是否真的处于展示态（记录仍存在）。
+    /// 导航、翻页、回车等入口都应以此判断，而不是 `openedFolder != nil`：
+    /// 否则 `rescan`/卸载把文件夹搬走或删掉后，网格虽然回退渲染，键盘与滑动却全部被挡住。
+    public var isFolderViewActive: Bool { openedFolderRecord != nil }
 
     /// 文件夹内重排：把拖拽项移到目标项之前。
     public func moveWithinFolder(draggingIDs: [String], folderID: UUID, beforeAppID: String) {
@@ -735,10 +792,17 @@ public final class LaunchpadModel {
     }
 
     /// 当前打开文件夹的记录。
+    ///
+    /// 按 `folderID` 跨页查找，而不是只看记录时的页下标：排序/重扫/整理会重建页面，
+    /// 文件夹可能换页；只用旧下标会让记录「悬空」，视图回退网格但模型仍认为在文件夹里。
     public var openedFolderRecord: FolderRecord? {
         guard let opened = openedFolder else { return nil }
-        guard opened.page < layout.pages.count else { return nil }
-        return layout.pages[opened.page].items.compactMap(\.folder).first { $0.id == opened.folderID }
+        for page in layout.pages {
+            if let folder = page.items.compactMap(\.folder).first(where: { $0.id == opened.folderID }) {
+                return folder
+            }
+        }
+        return nil
     }
 
     public func ungroupFolder(folderID: UUID) {
@@ -761,22 +825,24 @@ public final class LaunchpadModel {
     }
 
     public func createNewFolderOnCurrentPage() {
+        var created = false
         store.updateLayout { layout in
-            // resetLayout 后布局可能没有任何页面；补一页，避免 pages[-1] 崩溃
+            // resetLayout 后布局可能没有任何页面：补一页，避免 pages[-1] 崩溃
             if layout.pages.isEmpty {
                 layout.pages = [PageRecord()]
             }
-            // 建空文件夹：把当前页最后 1 个应用收进去（Launchpad 语义），
-            // 无应用时建一个空文件夹占位
+            // 建文件夹：把当前页最后 1 个应用收进去（Launchpad 语义）。
+            // 无应用时不建空文件夹占位——布局不变量「空文件夹不允许存在」，
+            // 空夹没有任何交互入口（点开是空白、拖出成员即删除），只会困扰用户。
             let page = min(max(currentPage, 0), layout.pages.count - 1)
-            if let lastAppID = layout.pages[page].items.last(where: { $0.appID != nil })?.appID {
-                layout.pages[page].items.removeAll { $0.appID == lastAppID }
-                let folder = FolderRecord(name: FolderEngine.defaultFolderName(layout: layout), appIDs: [lastAppID])
-                layout.pages[page].items.append(.folder(folder))
-            } else {
-                let folder = FolderRecord(name: FolderEngine.defaultFolderName(layout: layout), appIDs: [])
-                layout.pages[page].items.append(.folder(folder))
-            }
+            guard let lastAppID = layout.pages[page].items.last(where: { $0.appID != nil })?.appID else { return }
+            layout.pages[page].items.removeAll { $0.appID == lastAppID }
+            let folder = FolderRecord(name: FolderEngine.defaultFolderName(layout: layout), appIDs: [lastAppID])
+            layout.pages[page].items.append(.folder(folder))
+            created = true
+        }
+        if !created {
+            ToastManager.shared.show(.info, "当前页没有应用，无法新建文件夹")
         }
     }
 
@@ -817,20 +883,29 @@ public final class LaunchpadModel {
 
     /// 批量隐藏当前选择。单次 updateLayout 落盘（逐项调用会触发 N 次同步 JSON 写盘）。
     public func hideSelection() {
-        let ids = Array(selectedAppIDs)
-        guard !ids.isEmpty else { return }
+        // 先把已不在注册表里的陈旧选择剔掉，避免提示的数量比实际隐藏的多。
+        let ids = selectedAppIDs.filter { layout.apps[$0] != nil }
+        guard !ids.isEmpty else {
+            clearSelection()
+            return
+        }
         store.updateLayout { layout in
             for id in ids where layout.apps[id] != nil {
                 layout.apps[id]?.hidden = true
+                layout.detachFromGrid(id)
             }
         }
         ToastManager.shared.show(.info, "已隐藏 \(ids.count) 个应用")
         clearSelection()
+        if openedFolder != nil, openedFolderRecord == nil {
+            closeFolder()
+        }
     }
 
     /// 批量把选择合并进新文件夹。
     public func mergeSelectionIntoNewFolder() {
-        let ids = Array(selectedAppIDs).sorted { a, b in
+        let liveIDs = selectedAppIDs.filter { layout.apps[$0] != nil }
+        let ids = liveIDs.sorted { a, b in
             let an = layout.apps[a]?.name ?? ""
             let bn = layout.apps[b]?.name ?? ""
             return an.localizedStandardCompare(bn) == .orderedAscending
@@ -848,10 +923,27 @@ public final class LaunchpadModel {
             if layout.pages.isEmpty {
                 layout.pages = [PageRecord()]
             }
-            let page = min(max(self.currentPage, 0), layout.pages.count - 1)
+            let page = self.selectionAnchorPage(ids: ids, layout: layout)
             FolderEngine.mergeIntoNewFolder(appIDs: ids, page: page, layout: &layout)
         }
         clearSelection()
+    }
+
+    /// 多选合并的锚点页：当前页包含选中项时落在当前页；否则落到第一个含选中项的页。
+    /// 滚动模式下 currentPage 可能滞后于可视页，直接用 currentPage 会让文件夹出现在
+    /// 用户当时看不到的页（合并后「没有任何变化」）。
+    private func selectionAnchorPage(ids: [String], layout: LayoutSnapshot) -> Int {
+        guard !layout.pages.isEmpty else { return 0 }
+        let current = min(max(currentPage, 0), layout.pages.count - 1)
+        let selected = Set(ids)
+        func pageContainsSelection(_ page: PageRecord) -> Bool {
+            page.items.contains { item in
+                if let appID = item.appID { return selected.contains(appID) }
+                return item.folder?.appIDs.contains(where: selected.contains) == true
+            }
+        }
+        if pageContainsSelection(layout.pages[current]) { return current }
+        return layout.pages.firstIndex(where: pageContainsSelection) ?? current
     }
 
     // MARK: - 密度
@@ -877,29 +969,75 @@ public final class LaunchpadModel {
 
     // MARK: - 重扫
 
+    /// 上一次「来源目录读不到」提示对应的目录集合（集合变化时才再提示，避免重扫刷屏）。
+    @ObservationIgnored private var lastUnreadableDirectoriesNotice: Set<String> = []
+
     public func rescan() {
         isScanning = true
         let sources = store.state.sources
         let capacity = density.capacity
         Task.detached(priority: .userInitiated) { [weak self] in
-            // 扫描时保留既有 addedAt（NEW 只对真正的新应用亮）
-            let scanned = AppIndex.scan(sources: sources)
+            // 扫描时保留既有 addedAt（NEW 只对真正的新应用亮）。
+            // 用带诊断的版本：目录整体读不到（外置卷未挂载 / TCC 拒绝 / 安装器替换）时，
+            // 该目录下的应用不能被当成「已卸载」——否则两次重扫就会永久丢掉排列。
+            let diagnostics = AppIndex.scanWithDiagnostics(sources: sources)
             await MainActor.run { [weak self] in
                 guard let self else { return }
+                let unreadable = diagnostics.failedDirectories.map(\.path)
                 self.store.updateLayout { layout in
                     _ = SyncEngine.merge(
-                        scanned: scanned,
+                        scanned: diagnostics.records,
                         into: &layout,
-                        capacityPerPage: capacity
+                        capacityPerPage: capacity,
+                        unreadablePrefixes: unreadable
                     )
                     // 保留既有使用统计与 NEW 状态：merge 刷新元数据已保留；
                     // 这里恢复 addedAt（merge 不覆盖在册 addedAt，无需处理）
                 }
                 self.isScanning = false
                 self.icons.invalidateCache()
+                // 后台预热整仓图标：网格渲染（首展 / 滚动跨页）全部命中缓存，
+                // 不再在主线程做突发性的同步重采样
+                self.icons.preheat(
+                    paths: diagnostics.records.map(\.path),
+                    mode: self.settings.iconColorMode
+                )
                 // 非「自定义」排序模式下，扫描结果（含站外启动刷新的最近使用时间）落位后全局重排
                 self.store.applyActiveSort()
+                self.pruneSelection()
+                self.reconcileOpenedFolder()
+                self.notifyUnreadableDirectories(unreadable)
             }
         }
+    }
+
+    /// 清掉已不在注册表里的选择项（卸载 / 重扫移除后调用）。
+    private func pruneSelection() {
+        guard !selectedAppIDs.isEmpty else { return }
+        let live = selectedAppIDs.filter { layout.apps[$0] != nil }
+        if live != selectedAppIDs {
+            selectedAppIDs = live
+        }
+    }
+
+    /// 打开态文件夹已不存在（被摘空删除 / 已移出网格）时关闭它。
+    /// 否则模型仍认为在文件夹视图里：网格已回退渲染，但键盘/滑动/回车全被 `openedFolder` 挡住。
+    private func reconcileOpenedFolder() {
+        if openedFolder != nil, openedFolderRecord == nil {
+            closeFolder()
+        }
+    }
+
+    /// 来源目录整体读不到时给一次可见提示（目录集合变化才提示）：
+    /// 用户需要知道「应用暂时消失」不是被删除了，并去检查磁盘 / 权限。
+    private func notifyUnreadableDirectories(_ paths: [String]) {
+        let current = Set(paths)
+        guard current != lastUnreadableDirectoriesNotice else { return }
+        lastUnreadableDirectoriesNotice = current
+        guard !current.isEmpty else { return }
+        ToastManager.shared.show(
+            .info,
+            "有 \(current.count) 个应用来源目录暂时无法读取，已保留其中应用的排列（请检查外置磁盘是否已挂载、文件访问权限）"
+        )
     }
 }

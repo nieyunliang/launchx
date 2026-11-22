@@ -1,5 +1,6 @@
 import AppKit
 import os
+import ServiceManagement
 import SwiftUI
 
 /// 应用装配中枢：菜单栏/Dock 图标开关、唤起方式（快捷键/手势/菜单栏）、窗口装配、新应用监听。
@@ -22,7 +23,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     private lazy var toastController = ToastWindowController()
 
     private let hotKeyCenter = HotKeyCenter.shared
-    private let gestureMonitor = TrackpadGestureMonitor()
+    private let gestureMonitor = TrackpadTouchMonitor()
     private let newAppWatcher = NewAppWatcher()
 
     private var statusItem: NSStatusItem?
@@ -48,6 +49,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         toastController.install()
         if store.didRecoverFromCorruption {
             ToastManager.shared.error("布局文件已损坏，原文件已保留为 .corrupt 备份，本次从默认布局启动")
+        }
+        // 更高版本写入的 store.json：整场会话只读，必须明确告知，否则用户所有改动
+        //（隐藏 / 改名 / 拖拽 / 启动统计）都在退出时静默丢失。
+        if let readOnlyNotice = store.futureVersionReadOnlyNotice {
+            ToastManager.shared.error(readOnlyNotice)
         }
         launchpadModel.rescan()
         watchAppDirectories()
@@ -97,6 +103,8 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         #endif
 
+        showPanelOnColdLaunchIfWanted()
+
         // 冒烟模式：`LaunchX -launchx-smoke` 启动 1s 后自动打开 Launchpad，
         // 3s 后校验可见状态并退出（exit 0 = 通过；窗口装配崩溃则进程直接 SIGTRAP）。
         if ProcessInfo.processInfo.arguments.contains("-launchx-smoke") {
@@ -109,6 +117,73 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+
+    /// 兜底入口：用户在 Finder / 程序坞里再次打开 LaunchX 时，确保面板可见。
+    /// 即使所有唤起入口都被关掉（菜单栏、快捷键、手势、Dock 图标），重新打开 App 仍能唤出。
+    /// 进程尚未运行时的首次点击走全新启动，不投递 reopen 事件 —— 由 `showPanelOnColdLaunchIfWanted` 补上。
+    public func applicationShouldHandleReopen(
+        _ sender: NSApplication,
+        hasVisibleWindows flag: Bool
+    ) -> Bool {
+        launchpadController.show()
+        return false
+    }
+
+    // MARK: 冷启动唤起
+
+    /// 冷启动兜底：点击程序坞图标 / Finder 双击在「进程尚未运行」时走的是全新启动，
+    /// 系统不投递 reopen 事件、也不会激活 LSUIElement 应用（实测 `didBecomeActive` 不触发），
+    /// 表现为「点了程序坞图标毫无反应」。启动台类应用必须在启动完成时主动唤起面板。
+    private func showPanelOnColdLaunchIfWanted() {
+        let decision = Self.shouldShowPanelOnColdLaunch(
+            onboardingCompleted: store.state.settings.onboardingCompleted,
+            isSmokeMode: ProcessInfo.processInfo.arguments.contains("-launchx-smoke"),
+            loginItemEnabled: SMAppService.mainApp.status == .enabled,
+            secondsSinceLogin: Self.secondsSinceConsoleLogin()
+        )
+        Self.logger.info("cold launch auto-show: \(decision ? "show" : "skip", privacy: .public)")
+        guard decision else { return }
+        launchpadController.show()
+    }
+
+    /// 冷启动是否自动展开启动台（纯函数便于单测）。
+    static func shouldShowPanelOnColdLaunch(
+        onboardingCompleted: Bool,
+        isSmokeMode: Bool,
+        loginItemEnabled: Bool,
+        secondsSinceLogin: TimeInterval?
+    ) -> Bool {
+        guard onboardingCompleted else { return false }  // 首次启动只出引导页，不叠启动台
+        guard !isSmokeMode else { return false }         // 冒烟模式自带 1s 后的定时展示
+        // 登录项拉起的启动发生在登录后数秒内：开机即弹面板盖住桌面属于打扰，跳过。
+        // 读不到登录时间视为用户主动打开 —— 宁可多弹一次，也不能把 Dock 入口变哑。
+        if loginItemEnabled, let seconds = secondsSinceLogin, seconds < loginLaunchGracePeriod {
+            return false
+        }
+        return true
+    }
+
+    /// 登录项启动的判定时间窗：launchd 在会话激活后数秒内拉起登录项，留出慢机余量。
+    /// 误伤面（登录后立刻手动点图标的用户）最多多点一次图标即可唤出（走 reopen 路径）。
+    static let loginLaunchGracePeriod: TimeInterval = 90
+
+    /// 当前控制台会话距登录的时长；读不到（utmpx 无 console 记录）返回 nil。
+    static func secondsSinceConsoleLogin() -> TimeInterval? {
+        var loginTime: time_t?
+        setutxent()
+        defer { endutxent() }
+        while let entry = getutxent() {
+            guard entry.pointee.ut_type == USER_PROCESS else { continue }
+            let line = withUnsafeBytes(of: entry.pointee.ut_line) { bytes in
+                String(decoding: bytes.prefix { $0 != 0 }, as: UTF8.self)
+            }
+            guard line == "console" else { continue }
+            loginTime = entry.pointee.ut_tv.tv_sec
+            break
+        }
+        guard let loginTime else { return nil }
+        return Date().timeIntervalSince1970 - TimeInterval(loginTime)
     }
 
     public func applicationWillTerminate(_ notification: Notification) {
@@ -144,6 +219,11 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             // 来源目录可能已增删，同步重挂监听，否则新目录里后续放入的 app 不会自动重扫
             self?.watchAppDirectories()
         }
+        preferencesModel.onUnhideApp = { [weak self] appID in
+            // 必须走模型层：设置页直接改 hidden 不会把「恢复默认布局」后未摆放的
+            // 应用补摆回网格，默认搜索又排除隐藏应用 → 应用彻底失联。
+            self?.launchpadModel.unhide(appID: appID)
+        }
 
         hotKeyCenter.onTrigger = { [weak self] in self?.launchpadController.toggle() }
         gestureMonitor.onEvent = { [weak self] event in
@@ -173,7 +253,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // 触控板手势
-        gestureMonitor.setMode(settings.pinchGesture)
+        gestureMonitor.setEnabled(settings.pinchGestureEnabled)
 
         // 网格密度变化：按新容量重排（启动首次装配只记录，不动用户现有排列）。
         let density = settings.gridDensity
@@ -196,8 +276,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         var showMenuBar = store.state.settings.showMenuBarIcon
         if !showMenuBar {
             let settings = store.state.settings
+            // 手势只有拿到辅助功能权限才算有效入口（否则收得起、唤不起）。
             let hasAlternativeEntry = settings.hotKey != .none
-                || settings.pinchGesture != .off
+                || TrackpadTouchMonitor.isEntryAvailable(enabled: settings.pinchGestureEnabled)
                 || settings.showDockIcon
             if !hasAlternativeEntry {
                 showMenuBar = true
@@ -240,6 +321,9 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             Self.logger.fault("status item creation failed after retries; launchpad unreachable until relaunch or settings change")
+            // 不能继续往下把已摘除的 item 存进 statusItem：那样下次 setupStatusItem 会命中
+            // 「图标已存在仅刷新」早退分支，永远不再重建（菜单栏入口永久消失）。
+            return
         }
 
         let menu = NSMenu()
@@ -365,7 +449,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: 新应用监听
 
     private func watchAppDirectories() {
-        newAppWatcher.watch(directories: SourceConfig.scanDirectories(from: store.state.sources))
+        newAppWatcher.watch(directories: SourceConfig.watchDirectories(from: store.state.sources))
     }
 
     // MARK: 菜单动作

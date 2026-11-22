@@ -1,120 +1,199 @@
+import CoreGraphics
 import Foundation
 import Testing
 @testable import LaunchXCore
 
-// MARK: - 捏合手势档位（含四指精确档）
+// MARK: - 捏合手势开关（旧档位迁移）
 
 struct PinchGestureTests {
 
-    @Test func fourFingerOptionExistsWithLabel() {
-        #expect(PinchGesture.allCases.contains(.fourFinger))
-        #expect(PinchGesture.fourFinger.label == "四指捏合")
+    /// 旧版档位字符串迁移为开关：off → 关，其余档位 → 开（统一按四指识别）。
+    @Test func decodingLegacySettingsMigratesModesToToggle() throws {
+        let off = try JSONDecoder().decode(AppSettings.self, from: Data(#"{"pinchGesture":"off"}"#.utf8))
+        #expect(off.pinchGestureEnabled == false)
+
+        for legacy in ["threeFinger", "fourFinger", "fourFiveFinger", "fiveFinger"] {
+            let json = #"{"pinchGesture":"\#(legacy)"}"#
+            let decoded = try JSONDecoder().decode(AppSettings.self, from: Data(json.utf8))
+            #expect(decoded.pinchGestureEnabled == true, "legacy mode \(legacy)")
+        }
     }
 
-    @Test func allCasesOrderMatchesSettingsPicker() {
-        #expect(PinchGesture.allCases == [.off, .threeFinger, .fourFinger, .fourFiveFinger, .fiveFinger])
-    }
-
-    /// 手指越多累计幅度越大，阈值应随档位递增；关闭档不应触发。
-    @Test func triggerMagnitudeIncreasesWithFingerCount() {
-        let magnitudes = PinchGesture.allCases.map { TrackpadGestureMonitor.triggerMagnitude(for: $0) }
-        #expect(magnitudes[0] == .infinity)
-        #expect(magnitudes[1] < magnitudes[2])  // 三指 < 四指
-        #expect(magnitudes[2] < magnitudes[3])  // 四指 < 四或五指
-        #expect(magnitudes[3] < magnitudes[4])  // 四或五指 < 五指
-        #expect(magnitudes.allSatisfy { $0 > 0 })
-    }
-
-    @Test func decodingLegacySettingsKeepsPinchValues() throws {
-        // 旧版存档（不含四指档字段结构变化）仍可解码
-        let legacy = #"{"pinchGesture":"fourFiveFinger"}"#
-        let decoded = try JSONDecoder().decode(AppSettings.self, from: Data(legacy.utf8))
-        #expect(decoded.pinchGesture == .fourFiveFinger)
-
-        // 新档位原样往返
-        let fourFinger = #"{"pinchGesture":"fourFinger"}"#
-        let decodedFour = try JSONDecoder().decode(AppSettings.self, from: Data(fourFinger.utf8))
-        #expect(decodedFour.pinchGesture == .fourFinger)
-
-        // 默认值仍为关闭
-        #expect(AppSettings().pinchGesture == .off)
+    /// 新开关沿用旧 JSON 键「pinchGesture」往返存档。
+    @Test func toggleRoundTripsUnderLegacyKey() throws {
+        #expect(AppSettings().pinchGestureEnabled == true)  // 默认开启
         let encoded = try JSONEncoder().encode(AppSettings())
+        #expect(String(decoding: encoded, as: UTF8.self).contains(#""pinchGesture""#))
         let roundTripped = try JSONDecoder().decode(AppSettings.self, from: encoded)
-        #expect(roundTripped.pinchGesture == .off)
+        #expect(roundTripped.pinchGestureEnabled == true)
+
+        let disabled = AppSettings(pinchGestureEnabled: false)
+        let disabledData = try JSONEncoder().encode(disabled)
+        let decodedDisabled = try JSONDecoder().decode(AppSettings.self, from: disabledData)
+        #expect(decodedDisabled.pinchGestureEnabled == false)
     }
 }
 
-// MARK: - 逐帧跟手与吞帧拦截策略
+// MARK: - 捏合手势的视觉进度（回归：收起闪烁、不抬手反向闪烁）
 
-struct GestureInterceptionTests {
+/// 视觉过渡进度口径为 0=收起、1=展开（内容视图 transitionProgress）。
+/// 映射 = 会话起点可见性 + 有符号进度（张开为正、捏合为负），钳制 0...1：
+/// - 收起会话识别瞬间保持展开态（不闪烁到 0）；
+/// - 会话中途反向（不抬手捏合后再张开）过零天然连续，不弹回起点再塌缩。
+@Suite
+struct PinchVisualProgressTests {
 
-    private let threshold = TrackpadGestureMonitor.triggerMagnitude(for: .fourFinger)
-    private var recognition: CGFloat { threshold * TrackpadGestureMonitor.recognitionRatio }
-
-    /// 识别前的帧放行且不投递：普通小幅缩放不受影响。
-    @Test func passesFramesBelowRecognitionThreshold() {
-        let decision = TrackpadGestureMonitor.consumeDecision(
-            phase: .changed, magnitude: recognition / 2,
-            recognitionThreshold: recognition, intercepting: false)
-        #expect(!decision.consume)
-        #expect(!decision.intercepting)
-        #expect(!decision.emit)
+    /// 展开会话（起点收起）：张开正进度从 0 生长；中途捏合钳在收起态 0。
+    @Test func expandingSessionGrowsFromZero() {
+        #expect(LaunchpadWindowController.pinchVisualProgress(startVisible: false, signedProgress: 0) == 0)
+        #expect(LaunchpadWindowController.pinchVisualProgress(startVisible: false, signedProgress: 0.4) == 0.4)
+        #expect(LaunchpadWindowController.pinchVisualProgress(startVisible: false, signedProgress: 1) == 1)
+        #expect(LaunchpadWindowController.pinchVisualProgress(startVisible: false, signedProgress: -0.4) == 0)
     }
 
-    /// 到达识别点即开始逐帧跟手，而不是执行一次 toggle。
-    @Test func startsTrackingAtRecognitionThreshold() {
-        let decision = TrackpadGestureMonitor.consumeDecision(
-            phase: .changed, magnitude: recognition,
-            recognitionThreshold: recognition, intercepting: false)
-        #expect(decision.consume)
-        #expect(decision.intercepting)
-        #expect(decision.emit)
+    /// 收起会话（起点展开）：捏合从 1 收缩；中途张开平滑回满后钳在 1。
+    @Test func collapsingSessionShrinksFromOne() {
+        #expect(LaunchpadWindowController.pinchVisualProgress(startVisible: true, signedProgress: 0) == 1)
+        #expect(LaunchpadWindowController.pinchVisualProgress(startVisible: true, signedProgress: -0.4) == 0.6)
+        #expect(LaunchpadWindowController.pinchVisualProgress(startVisible: true, signedProgress: -1) == 0)
+        #expect(LaunchpadWindowController.pinchVisualProgress(startVisible: true, signedProgress: 0.4) == 1)
     }
 
-    /// ended 必须投递给窗口层落位，同时结束拦截；下一手势重新判定。
-    @Test func deliversEndedAndResetsInterception() {
-        let ended = TrackpadGestureMonitor.consumeDecision(
-            phase: .ended, magnitude: threshold,
-            recognitionThreshold: recognition, intercepting: true)
-        #expect(ended.consume)
-        #expect(!ended.intercepting)
-        #expect(ended.emit)
-
-        let began = TrackpadGestureMonitor.consumeDecision(
-            phase: .began, magnitude: 0,
-            recognitionThreshold: recognition, intercepting: false)
-        #expect(!began.consume && !began.intercepting && !began.emit)
+    /// 反向过零连续：±ε 在过零两侧衔接（两个起点方向都不跳变）。
+    @Test func reversalPassesZeroContinuously() {
+        let collapsingBefore = LaunchpadWindowController.pinchVisualProgress(startVisible: true, signedProgress: -0.001)
+        let collapsingAfter = LaunchpadWindowController.pinchVisualProgress(startVisible: true, signedProgress: 0.001)
+        #expect(abs(collapsingBefore - collapsingAfter) < 0.01)
+        let expandingBefore = LaunchpadWindowController.pinchVisualProgress(startVisible: false, signedProgress: -0.001)
+        let expandingAfter = LaunchpadWindowController.pinchVisualProgress(startVisible: false, signedProgress: 0.001)
+        #expect(abs(expandingBefore - expandingAfter) < 0.01)
     }
 
-    /// 系统取消同样投递，以便窗口回退；取消帧仍被吞掉。
-    @Test func deliversCancelledGestureForRollback() {
-        let decision = TrackpadGestureMonitor.consumeDecision(
-            phase: .cancelled, magnitude: threshold,
-            recognitionThreshold: recognition, intercepting: true)
-        #expect(decision.consume)
-        #expect(!decision.intercepting)
-        #expect(decision.emit)
+    /// 越界值钳制到 0...1。
+    @Test func clampsOutOfRange() {
+        #expect(LaunchpadWindowController.pinchVisualProgress(startVisible: false, signedProgress: 1.5) == 1)
+        #expect(LaunchpadWindowController.pinchVisualProgress(startVisible: false, signedProgress: -1.5) == 0)
+        #expect(LaunchpadWindowController.pinchVisualProgress(startVisible: true, signedProgress: -1.5) == 0)
+        #expect(LaunchpadWindowController.pinchVisualProgress(startVisible: true, signedProgress: 1.5) == 1)
+    }
+}
+
+@MainActor
+struct PinchCloseSessionTests {
+
+    private func makeController() throws -> (controller: LaunchpadWindowController, model: LaunchpadModel, dir: URL) {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LaunchXPinch-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let store = LayoutStore(directory: dir)
+        // 回退路径会经 targetScreen() 安排壁纸刷新：测试进程未创建 NSApp，
+        // 「激活屏」档位会隐式解包 NSApp.keyWindow 而崩溃，固定为「主屏」档；
+        // 同时关闭模糊壁纸，回退后走轻量分支，不做屏幕捕获。
+        store.updateSettings {
+            $0.screenPosition = .main
+            $0.blurWallpaper = false
+        }
+        let model = LaunchpadModel(store: store)
+        return (LaunchpadWindowController(model: model), model, dir)
     }
 
-    /// 识别点为 0、完整行程为 1，中间线性跟手，越界值钳制。
-    @Test func mapsGestureMagnitudeToNormalizedProgress() {
-        #expect(TrackpadGestureMonitor.normalizedProgress(
-            magnitude: recognition, threshold: threshold) == 0)
-        #expect(TrackpadGestureMonitor.normalizedProgress(
-            magnitude: (recognition + threshold) / 2, threshold: threshold) == 0.5)
-        #expect(TrackpadGestureMonitor.normalizedProgress(
-            magnitude: threshold, threshold: threshold) == 1)
-        #expect(TrackpadGestureMonitor.normalizedProgress(
-            magnitude: threshold * 2, threshold: threshold) == 1)
-        #expect(TrackpadGestureMonitor.normalizedProgress(
-            magnitude: 0, threshold: threshold) == 0)
+    /// 识别瞬间面板保持展开态（1 - p），不得跳到 0；跟手阶段随手势收缩。
+    @Test func closeRecognitionKeepsPanelExpandedInsteadOfFlashing() throws {
+        let (controller, model, dir) = try makeController()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        model.show()
+        controller.handlePinchGesture(PinchGestureEvent(phase: .began, signedProgress: 0))
+        controller.handlePinchGesture(PinchGestureEvent(phase: .changed, signedProgress: -0.05))
+        // 首帧视觉 = 1 - 0.05（旧实现为 0.05，即闪烁到全透明的根因）
+        #expect(abs((model.pinchTransitionProgress ?? 0) - 0.95) < 0.0001)
+        controller.handlePinchGesture(PinchGestureEvent(phase: .changed, signedProgress: -0.4))
+        #expect(abs((model.pinchTransitionProgress ?? 0) - 0.6) < 0.0001)
+        // 松手过半：提交收起，视觉交还 isVisible 驱动（false → 0）
+        controller.handlePinchGesture(PinchGestureEvent(phase: .ended, signedProgress: -0.8))
+        #expect(!model.isVisible)
+        #expect(model.pinchTransitionProgress == nil)
     }
 
-    /// 松手过半完成，未过半或系统取消则回退；方向不影响提交判断。
-    @Test func settlesFromCurrentProgress() {
-        #expect(LaunchpadWindowController.shouldCommitPinch(progress: 0.5, cancelled: false))
-        #expect(LaunchpadWindowController.shouldCommitPinch(progress: -0.5, cancelled: false))
-        #expect(!LaunchpadWindowController.shouldCommitPinch(progress: 0.49, cancelled: false))
-        #expect(!LaunchpadWindowController.shouldCommitPinch(progress: 1, cancelled: true))
+    /// 松手未过半：回退到展开态，不落位收起。
+    @Test func closeBelowHalfRollsBackToExpanded() throws {
+        let (controller, model, dir) = try makeController()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        model.show()
+        controller.handlePinchGesture(PinchGestureEvent(phase: .began, signedProgress: 0))
+        controller.handlePinchGesture(PinchGestureEvent(phase: .changed, signedProgress: -0.3))
+        controller.handlePinchGesture(PinchGestureEvent(phase: .ended, signedProgress: -0.3))
+        #expect(model.isVisible)
+        #expect(model.pinchTransitionProgress == nil)
+    }
+
+    /// 上一手势缺终帧时，新手势 began 先无动画回退；新会话不继承半途的视觉状态。
+    @Test func staleCloseGestureRollsBackOnNextBegan() throws {
+        let (controller, model, dir) = try makeController()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        model.show()
+        controller.handlePinchGesture(PinchGestureEvent(phase: .began, signedProgress: 0))
+        controller.handlePinchGesture(PinchGestureEvent(phase: .changed, signedProgress: -0.4))
+        controller.handlePinchGesture(PinchGestureEvent(phase: .began, signedProgress: 0))
+        #expect(model.isVisible)
+        #expect(model.pinchTransitionProgress == nil)
+    }
+
+    // MARK: 不抬手反向（捏合中途再张开 / 张开中途再捏合）
+
+    /// 不抬手「捏合 → 张开」：过零后视觉钳在展开态（不弹回起点再塌缩），
+    /// 终帧为张开且过半时保持展开。回归：冻结方向的旧映射在这里先闪烁、
+    /// 并把终帧 +0.6 误判成「收起提交」把面板关掉。
+    @Test func pinchThenSpreadWithoutLiftStaysOpen() throws {
+        let (controller, model, dir) = try makeController()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        model.show()
+        controller.handlePinchGesture(PinchGestureEvent(phase: .began, signedProgress: 0))
+        controller.handlePinchGesture(PinchGestureEvent(phase: .changed, signedProgress: -0.6))
+        #expect(abs((model.pinchTransitionProgress ?? 0) - 0.4) < 0.0001)
+        // 反向张开：过零附近视觉 ≈1 且继续张开钳在 1（旧实现塌回 0.8 → 闪烁）
+        controller.handlePinchGesture(PinchGestureEvent(phase: .changed, signedProgress: 0.2))
+        #expect(abs((model.pinchTransitionProgress ?? 0) - 1) < 0.0001)
+        controller.handlePinchGesture(PinchGestureEvent(phase: .changed, signedProgress: 0.6))
+        #expect(abs((model.pinchTransitionProgress ?? 0) - 1) < 0.0001)
+        controller.handlePinchGesture(PinchGestureEvent(phase: .ended, signedProgress: 0.6))
+        #expect(model.isVisible)
+        #expect(model.pinchTransitionProgress == nil)
+    }
+
+    /// 不抬手「捏合 → 张开 → 再捏合并过半」：按终帧方向收起。
+    @Test func spreadBackThenPinchDeepCloses() throws {
+        let (controller, model, dir) = try makeController()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        model.show()
+        controller.handlePinchGesture(PinchGestureEvent(phase: .began, signedProgress: 0))
+        controller.handlePinchGesture(PinchGestureEvent(phase: .changed, signedProgress: -0.3))
+        #expect(abs((model.pinchTransitionProgress ?? 0) - 0.7) < 0.0001)
+        controller.handlePinchGesture(PinchGestureEvent(phase: .changed, signedProgress: 0.5))
+        #expect(abs((model.pinchTransitionProgress ?? 0) - 1) < 0.0001)
+        controller.handlePinchGesture(PinchGestureEvent(phase: .changed, signedProgress: -0.9))
+        #expect(abs((model.pinchTransitionProgress ?? 0) - 0.1) < 0.0001)
+        controller.handlePinchGesture(PinchGestureEvent(phase: .ended, signedProgress: -0.9))
+        #expect(!model.isVisible)
+        #expect(model.pinchTransitionProgress == nil)
+    }
+
+    /// 展开会话中途捏回但未过半：手指回撤时面板跟着收缩（有符号进度是相对
+    /// 手势起点的绝对值，捏过头钳在收起态 0），终帧低于一半回退到会话起点（收起）。
+    @Test func openSessionPinchBackBelowHalfRevertsToHidden() throws {
+        let (controller, model, dir) = try makeController()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        #expect(!model.isVisible)
+        controller.handlePinchGesture(PinchGestureEvent(phase: .began, signedProgress: 0))
+        controller.handlePinchGesture(PinchGestureEvent(phase: .changed, signedProgress: 0.7))
+        #expect(abs((model.pinchTransitionProgress ?? 0) - 0.7) < 0.0001)
+        // 手指回撤（仍为正）：面板从 0.7 收缩到 0.2，连续无跳变
+        controller.handlePinchGesture(PinchGestureEvent(phase: .changed, signedProgress: 0.2))
+        #expect(abs((model.pinchTransitionProgress ?? 0) - 0.2) < 0.0001)
+        // 捏过头（过零为负）：钳在收起态 0
+        controller.handlePinchGesture(PinchGestureEvent(phase: .changed, signedProgress: -0.4))
+        #expect(model.pinchTransitionProgress == 0)
+        controller.handlePinchGesture(PinchGestureEvent(phase: .ended, signedProgress: -0.4))
+        #expect(!model.isVisible)
+        #expect(model.pinchTransitionProgress == nil)
     }
 }

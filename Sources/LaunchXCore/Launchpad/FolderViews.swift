@@ -17,27 +17,27 @@ struct FolderCell: View {
         VStack(spacing: 7) {
             folderPreview
                 .overlay(alignment: .topTrailing) { hoverBadge }
+                .onTapGesture { openFolder() }
             if !model.settings.hideAppNames {
                 Text(folder.name)
                     .font(.system(size: metrics.labelFont))
                     .foregroundStyle(.white.opacity(0.92))
                     .shadow(color: .black.opacity(0.8), radius: 1.5, y: 1)
                     .lineLimit(1)
-                    // 名称不撑满格宽：点击热区跟随内容自然宽度
+                    // 热区挂在截断 frame 之前的文本自身边界上（同 AppCell）：
+                    // maxWidth 弹性 frame 会撑满格宽，手势挂在外面会让
+                    // 短名称两侧空白也可点
+                    .contentShape(Rectangle())
                     .frame(maxWidth: metrics.cellWidth - 4)
+                    .onTapGesture { openFolder() }
             }
         }
         .padding(.horizontal, 2)
-        // 点击热区只覆盖预览+名称的可见内容，不吃满整个格子；
-        // 格子其余空白落回页面背景手势
+        // 点击热区只覆盖预览+名称可见内容（手势挂在 folderPreview 与 Text 上），
+        // 格子空白落回页面背景手势；右键与悬停徽章仍覆盖整格。
         .contentShape(Rectangle())
-        .onTapGesture {
-            withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                model.openFolder(page: pageIndex, folderID: folder.id)
-            }
-        }
-        .onHover { hovered = $0 }
         .contextMenu { folderMenu }
+        .onHover { hovered = $0 }
         // 手势之后才撑满格宽：布局居中不变，热区跟随内容
         .frame(maxWidth: .infinity)
         // 文件夹暂不支持整体拖拽：若把 folder.appIDs 当载荷拖出，
@@ -81,6 +81,14 @@ struct FolderCell: View {
                 RoundedRectangle(cornerRadius: corner, style: .continuous)
                     .strokeBorder(LXColors.accent, lineWidth: 2)
             }
+        }
+        // 玻璃面板整块都是可见内容，热区=整块预览（显式声明，不依赖材质的默认命中）
+        .contentShape(Rectangle())
+    }
+
+    private func openFolder() {
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+            model.openFolder(page: pageIndex, folderID: folder.id)
         }
     }
 

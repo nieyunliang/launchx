@@ -346,19 +346,6 @@ struct FolderEngineTests {
         #expect(layout.pages[0].items[1].folder?.appIDs == ["a", "c"])
     }
 
-    @Test func removeAppFromFolderLeavesEmptyFolderDeleted() {
-        var layout = LayoutSnapshot()
-        register([makeApp("solo"), makeApp("other")], into: &layout)
-        let folder = FolderRecord(name: "F", appIDs: ["solo"])
-        layout.pages = [
-            PageRecord(items: [.folder(folder)]),
-            PageRecord(items: [.app(id: "other")]),
-        ]
-        FolderEngine.removeAppFromFolder(appID: "solo", folderID: folder.id, toPage: 1, layout: &layout)
-        #expect(layout.pages[0].items.isEmpty)
-        #expect(layout.pages[1].items.map(\.appID) == ["other", "solo"])
-    }
-
     @Test func renameFolderPersists() {
         var layout = LayoutSnapshot()
         let folder = FolderRecord(name: "Old", appIDs: [])

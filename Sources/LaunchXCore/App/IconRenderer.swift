@@ -4,6 +4,17 @@ import AppKit
 /// 「深空底 + 应用瓦片网格」视觉语言，与 resources/AppIcon.icns（scripts/icon_gen.swift 生成）同源。
 enum AppIconRenderer {
 
+    /// 分辨率无关的图标绘制：`NSImage(size:flipped:drawingHandler:)` 由 AppKit
+    /// 按目标屏幕缩放比调用，避免 `lockFocus`（已废弃）生成单一固定分辨率位图后
+    /// 在 2x/多屏下被重采样发糊。
+    nonisolated static func drawingIcon(size: NSSize, _ draw: @escaping (CGContext) -> Void) -> NSImage {
+        NSImage(size: size, flipped: false) { _ in
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
+            draw(ctx)
+            return true
+        }
+    }
+
     // MARK: - 程序坞图标
 
     /// 自绘主题图标（128pt）：
@@ -13,18 +24,14 @@ enum AppIconRenderer {
     /// - rocket：彩色九宫格 + 橙色焦点瓦 + 白色火箭符号
     nonisolated static func appIcon(for theme: AppIconTheme, dark: Bool) -> NSImage {
         let side: CGFloat = 128
-        let image = NSImage(size: NSSize(width: side, height: side))
-        image.lockFocus()
-        defer { image.unlockFocus() }
-        guard let ctx = NSGraphicsContext.current?.cgContext else { return image }
-
         let palette = Self.palette(for: theme, dark: dark)
-        drawBoard(in: ctx, side: side, palette: palette)
-        drawTiles(in: ctx, side: side, palette: palette)
-        if palette.rocketCenter {
-            drawRocketBadge(in: ctx, side: side, rows: palette.tiles.count)
+        return Self.drawingIcon(size: NSSize(width: side, height: side)) { ctx in
+            Self.drawBoard(in: ctx, side: side, palette: palette)
+            Self.drawTiles(in: ctx, side: side, palette: palette)
+            if palette.rocketCenter {
+                Self.drawRocketBadge(in: ctx, side: side, rows: palette.tiles.count)
+            }
         }
-        return image
     }
 
     // MARK: - 菜单栏模板图标
@@ -33,20 +40,18 @@ enum AppIconRenderer {
     nonisolated static func menuBarIcon(for theme: AppIconTheme) -> NSImage {
         let side: CGFloat = 18
         let count = theme == .classic ? 2 : 3
-        let image = NSImage(size: NSSize(width: side, height: side))
-        image.lockFocus()
-        defer { image.unlockFocus() }
-
-        let margin = side * 0.06
-        let gap = side * 0.115
-        let tile = (side - 2 * margin - CGFloat(count - 1) * gap) / CGFloat(count)
-        NSColor.black.setFill()
-        for row in 0..<count {
-            for col in 0..<count {
-                let rect = CGRect(x: margin + CGFloat(col) * (tile + gap),
-                                  y: margin + CGFloat(row) * (tile + gap),
-                                  width: tile, height: tile)
-                NSBezierPath(roundedRect: rect, xRadius: tile * 0.32, yRadius: tile * 0.32).fill()
+        let image = Self.drawingIcon(size: NSSize(width: side, height: side)) { _ in
+            let margin = side * 0.06
+            let gap = side * 0.115
+            let tile = (side - 2 * margin - CGFloat(count - 1) * gap) / CGFloat(count)
+            NSColor.black.setFill()
+            for row in 0..<count {
+                for col in 0..<count {
+                    let rect = CGRect(x: margin + CGFloat(col) * (tile + gap),
+                                      y: margin + CGFloat(row) * (tile + gap),
+                                      width: tile, height: tile)
+                    NSBezierPath(roundedRect: rect, xRadius: tile * 0.32, yRadius: tile * 0.32).fill()
+                }
             }
         }
         image.isTemplate = true
@@ -218,12 +223,11 @@ enum AppIconRenderer {
 
         guard let base = NSImage(systemSymbolName: "rocket.fill", accessibilityDescription: "LaunchX")?
             .withSymbolConfiguration(.init(pointSize: tile * 0.62 * k, weight: .semibold)) else { return }
-        let tinted = NSImage(size: base.size)
-        tinted.lockFocus()
-        base.draw(in: NSRect(origin: .zero, size: base.size))
-        NSColor.white.set()
-        NSRect(origin: .zero, size: base.size).fill(using: .sourceAtop)
-        tinted.unlockFocus()
+        let tinted = Self.drawingIcon(size: base.size) { _ in
+            base.draw(in: NSRect(origin: .zero, size: base.size))
+            NSColor.white.set()
+            NSRect(origin: .zero, size: base.size).fill(using: .sourceAtop)
+        }
 
         let drawRect = CGRect(x: cx - base.size.width / 2, y: cy - base.size.height / 2,
                               width: base.size.width, height: base.size.height)

@@ -119,7 +119,7 @@ public enum SortEngine {
         }
 
         if options.alsoSortFolderContents {
-            sortAllFolderContents(&layout, key: key, ascending: ascending)
+            sortAllFolderContents(&layout, key: key, ascending: ascending, pageIndices: pageIndices)
         }
         return true
     }
@@ -177,9 +177,16 @@ public enum SortEngine {
         }
     }
 
-    /// 文件夹内应用按排序键重排（全部文件夹）。
-    static func sortAllFolderContents(_ layout: inout LayoutSnapshot, key: SortKey, ascending: Bool) {
-        for pageIndex in layout.pages.indices {
+    /// 文件夹内应用按排序键重排。
+    /// - Parameter pageIndices: 限定作用域；`nil` 表示全部页面（全局重排时使用）。
+    static func sortAllFolderContents(
+        _ layout: inout LayoutSnapshot,
+        key: SortKey,
+        ascending: Bool,
+        pageIndices: [Int]? = nil
+    ) {
+        let indices = pageIndices ?? Array(layout.pages.indices)
+        for pageIndex in indices where layout.pages.indices.contains(pageIndex) {
             for slotIndex in layout.pages[pageIndex].items.indices {
                 guard var folder = layout.pages[pageIndex].items[slotIndex].folder else { continue }
                 folder.appIDs = sortedAppIDs(folder.appIDs, apps: layout.apps, key: key, ascending: ascending)
@@ -293,35 +300,46 @@ public enum ReorganizeEngine {
 
     /// Reorganize Across Pages：把作用域内全部槽位按当前视觉顺序取出，
     /// 连续重铺（页满顺延下一页），页数随内容增减；作用域外的页保持不动。
+    ///
+    /// 作用域可能不连续（「选择页面」允许只勾第 1、3 页）。此时必须按**连续段**分别重铺，
+    /// 段与段之间未选中的页原样保留——旧实现用 `indices.min()...max()` 覆盖整个跨度，
+    /// 会把夹在中间、未选中的页整页丢弃（内容仍在注册表里，但网格上再也看不到）。
     public static func reorganizeAcrossPages(
         _ layout: inout LayoutSnapshot,
         scope: SortScope,
         capacityPerPage capacity: Int
     ) {
         guard capacity > 0 else { return }
-        let indices = scope.pageIndices(totalPages: layout.pages.count)
-        guard let firstIndex = indices.min(), let lastIndex = indices.max() else { return }
+        let selected = Set(scope.pageIndices(totalPages: layout.pages.count))
+        guard !selected.isEmpty else { return }
 
-        let collected = indices.flatMap { layout.pages[$0].items }
-
-        // 作用域前的页 + 重铺的页 + 作用域后的页
-        var newPages: [PageRecord] = Array(layout.pages[0..<firstIndex])
-        if collected.isEmpty {
-            // 作用域内无内容：不生成空页
-        } else {
-            var currentPage = PageRecord()
-            for item in collected {
-                if currentPage.items.count >= capacity {
-                    newPages.append(currentPage)
-                    currentPage = PageRecord()
-                }
-                currentPage.items.append(item)
+        var newPages: [PageRecord] = []
+        var pageIndex = 0
+        while pageIndex < layout.pages.count {
+            guard selected.contains(pageIndex) else {
+                newPages.append(layout.pages[pageIndex])
+                pageIndex += 1
+                continue
             }
-            newPages.append(currentPage)
-        }
-
-        if lastIndex + 1 < layout.pages.count {
-            newPages.append(contentsOf: layout.pages[(lastIndex + 1)...])
+            // 收集一段连续选中页，段内内容一起重铺
+            var runEnd = pageIndex
+            var collected: [SlotItem] = []
+            while runEnd < layout.pages.count, selected.contains(runEnd) {
+                collected.append(contentsOf: layout.pages[runEnd].items)
+                runEnd += 1
+            }
+            if !collected.isEmpty {
+                var currentPage = PageRecord()
+                for item in collected {
+                    if currentPage.items.count >= capacity {
+                        newPages.append(currentPage)
+                        currentPage = PageRecord()
+                    }
+                    currentPage.items.append(item)
+                }
+                newPages.append(currentPage)
+            }
+            pageIndex = runEnd
         }
         if newPages.isEmpty { newPages = [PageRecord()] }
         layout.pages = newPages
@@ -363,11 +381,16 @@ public enum FolderEngine {
         folderID: UUID,
         layout: inout LayoutSnapshot
     ) {
-        let movable = appIDs.filter { layout.apps[$0]?.hidden != true }
+        let movable = uniqueVisibleAppIDs(appIDs, layout: layout)
         guard !movable.isEmpty,
               let pageIndex = layout.pageIndexOfFolder(folderID),
-              layout.pages[pageIndex].items.contains(where: { $0.folder?.id == folderID }) else { return }
+              let currentFolder = layout.pages[pageIndex].items.compactMap(\.folder).first(where: { $0.id == folderID }) else { return }
+        // 全部已经是该文件夹成员：无需移动（否则「先摘除再追加」会改变成员顺序）
+        if Set(movable).isSubset(of: Set(currentFolder.appIDs)) { return }
         for appID in movable {
+            // 防御：应用可能已被别的文件夹持有（历史数据 / 陈旧选择），先摘除再合入，
+            // 保证「一个应用只出现一次」的布局不变量。
+            layout.removeAppFromAnyFolder(appID)
             removeAppFromDirectLayout(appID, layout: &layout)
         }
         // 重查（移除后下标可能变化）
@@ -391,15 +414,31 @@ public enum FolderEngine {
             mergeIntoFolder(appIDs: appIDs, folderID: folderID, layout: &layout)
             return
         }
-        let movable = appIDs.filter { layout.apps[$0]?.hidden != true }
+        // 去重：同一 id 重复出现会让文件夹里出现两份
+        let movable = uniqueVisibleAppIDs(appIDs, layout: layout)
         guard movable.count >= 1 else { return }
-        let folder = FolderRecord(name: defaultFolderName(layout: layout), appIDs: movable)
+        // 防御：成员可能已属于某个文件夹（陈旧多选 / 跨页合并且未先摘除），
+        // 先摘除所有旧位置，否则同一应用会同时出现在两个文件夹里。
         for appID in movable {
+            layout.removeAppFromAnyFolder(appID)
             removeAppFromDirectLayout(appID, layout: &layout)
         }
-        let pageIndex = min(page, layout.pages.count - 1)
+        if layout.pages.isEmpty {
+            layout.pages = [PageRecord()]
+        }
+        let folder = FolderRecord(name: defaultFolderName(layout: layout), appIDs: movable)
+        let pageIndex = min(max(page, 0), layout.pages.count - 1)
         layout.pages[pageIndex].items.append(.folder(folder))
         layout.removeEmptyPages()
+    }
+
+    /// 去重并过滤隐藏 / 未知应用的 id 列表（保持输入顺序）。
+    private static func uniqueVisibleAppIDs(_ appIDs: [String], layout: LayoutSnapshot) -> [String] {
+        var seen = Set<String>()
+        return appIDs.filter { appID in
+            guard layout.apps[appID] != nil, layout.apps[appID]?.hidden != true else { return false }
+            return seen.insert(appID).inserted
+        }
     }
 
     /// 解散文件夹：应用追加到文件夹所在页末尾（页满顺延下一页）。
@@ -440,32 +479,6 @@ public enum FolderEngine {
         var folder = layout.pages[pageIndex].items[slotIndex].folder!
         folder.name = name
         layout.pages[pageIndex].items[slotIndex] = .folder(folder)
-    }
-
-    /// 从文件夹移出一个应用，放回指定页直接摆放（拖出文件夹用）。
-    public static func removeAppFromFolder(
-        appID: String,
-        folderID: UUID,
-        toPage pageIndex: Int,
-        slot: Int? = nil,
-        layout: inout LayoutSnapshot
-    ) {
-        guard let folderPage = layout.pageIndexOfFolder(folderID),
-              let slotIndex = layout.pages[folderPage].items.firstIndex(where: { $0.folder?.id == folderID }) else { return }
-        var folder = layout.pages[folderPage].items[slotIndex].folder!
-        folder.appIDs.removeAll { $0 == appID }
-        if folder.appIDs.isEmpty {
-            layout.pages[folderPage].items.remove(at: slotIndex)
-        } else {
-            layout.pages[folderPage].items[slotIndex] = .folder(folder)
-        }
-
-        let target = min(pageIndex, layout.pages.count - 1)
-        if let slot, slot <= layout.pages[target].items.count {
-            layout.pages[target].items.insert(.app(id: appID), at: slot)
-        } else {
-            layout.pages[target].items.append(.app(id: appID))
-        }
     }
 
     // MARK: 内部

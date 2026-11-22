@@ -47,6 +47,21 @@ struct LayoutModelTests {
         #expect(layout.pages[0].items.map(\.appID) == ["x"])
     }
 
+    @Test func purgeEmptyFoldersKeepsPopulatedFoldersAndApps() {
+        let populated = FolderRecord(name: "F1", appIDs: ["a"])
+        var layout = LayoutSnapshot(pages: [
+            PageRecord(items: [
+                .folder(FolderRecord(name: "Empty1", appIDs: [])),
+                .app(id: "x"),
+                .folder(populated),
+            ]),
+            PageRecord(items: [.folder(FolderRecord(name: "Empty2", appIDs: []))]),
+        ])
+        layout.purgeEmptyFolders()
+        #expect(layout.pages.count == 1)  // 第 2 页清空后连页一起移除
+        #expect(layout.pages[0].items == [.app(id: "x"), .folder(populated)])
+    }
+
     @Test func folderLocationAndPageLookup() {
         var layout = LayoutSnapshot()
         let folder = FolderRecord(name: "F", appIDs: ["inner"])

@@ -55,7 +55,9 @@ public struct PersistState: Codable, Hashable, Sendable {
         self.version = c.tolerant(Int.self, forKey: .version, default: Self.currentVersion)
         self.layout = c.tolerant(LayoutSnapshot.self, forKey: .layout, default: LayoutSnapshot())
         self.settings = c.tolerant(AppSettings.self, forKey: .settings, default: AppSettings())
-        self.sources = c.tolerant([SourceConfig].self, forKey: .sources, default: [])
+        // 按条解码：单个来源损坏只丢该条（整段回退会把用户所有自定义目录一起清空）。
+        let lossySources = c.tolerant([Lossy<SourceConfig>].self, forKey: .sources, default: [])
+        self.sources = lossySources.compactMap(\.value)
     }
 }
 
@@ -80,6 +82,12 @@ public final class LayoutStore {
 
     /// 读到未来版本（version > currentVersion）时为 true：本次会话只读，绝不覆盖新版文件。
     public private(set) var isReadOnlyForFutureVersion = false
+
+    /// 只读模式的用户提示（非只读为 nil）：说明本次改动不会保存，并提供备份文件位置。
+    public var futureVersionReadOnlyNotice: String? {
+        guard isReadOnlyForFutureVersion else { return nil }
+        return "配置文件由更高版本的 LaunchX 写入（v\(state.version)），本次会话为只读：所有更改都不会保存。文件：\(storeFileURL.path)"
+    }
 
     public let storeFileURL: URL
     /// 上一次成功落盘的备份（每次 saveNow 前复制）。
@@ -124,6 +132,9 @@ public final class LayoutStore {
         if state.layout.pages.isEmpty {
             state.layout.pages = [PageRecord()]
         }
+        // 兜底清扫：旧版本 / 手工编辑的 store.json 里可能残留空文件夹，
+        // 运行期所有路径都不产生空夹，加载时清一次保证不变量成立。
+        state.layout.purgeEmptyFolders()
     }
 
     /// 默认数据目录：`~/Library/Application Support/LaunchX`。
@@ -295,6 +306,19 @@ public final class LayoutStore {
             try saveNow()
         } catch {
             Self.logger.error("自动落盘失败：\(error.localizedDescription, privacy: .public)")
+            notifyPersistFailureOnce(error)
         }
     }
+
+    /// 会话内只提示一次：磁盘满 / 目录只读时每次改动都失败，逐次弹 Toast 会刷屏。
+    private func notifyPersistFailureOnce(_ error: Error) {
+        guard !didNotifyPersistFailure else { return }
+        didNotifyPersistFailure = true
+        ToastManager.shared.error(
+            "布局/设置保存失败：\(error.localizedDescription)。本次会话的改动可能不会保留，请检查磁盘空间与文件权限。"
+        )
+    }
+
+    /// 是否已就落盘失败提示过用户。
+    @ObservationIgnored private var didNotifyPersistFailure = false
 }

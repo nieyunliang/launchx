@@ -40,6 +40,8 @@ public final class PreferencesModel {
     public var onApplySettings: (() -> Void)?
     /// 触发重扫。
     public var onRescan: (() -> Void)?
+    /// 取消隐藏应用（AppDelegate 接到 `LaunchpadModel.unhide`：会把未摆放的应用补摆回网格）。
+    public var onUnhideApp: ((String) -> Void)?
 
     public init(store: LayoutStore) {
         self.store = store
@@ -68,6 +70,27 @@ public final class PreferencesModel {
         store.updateSettings { $0.launchAtLogin = LoginItemService.isEffectivelyEnabled }
     }
 
+    // MARK: 隐藏应用
+
+    /// 取消隐藏。优先走 `LaunchpadModel.unhide`（会按当前密度把未摆放的应用补摆到末页）；
+    /// 未接线时用等价后备实现——直接改 hidden 会让「恢复默认布局」后只存在注册表的
+    /// 隐藏项既不回网格、默认搜索也搜不到，等于彻底失联。
+    public func unhideApp(id: String) {
+        if let onUnhideApp {
+            onUnhideApp(id)
+            return
+        }
+        let capacity = store.state.settings.gridDensity.capacity
+        store.updateLayout { layout in
+            guard let app = layout.apps[id] else { return }
+            layout.apps[id]?.hidden = false
+            if !app.isAlias, !layout.placedAppIDs.contains(id) {
+                layout.appendApp(id: id, toPage: max(layout.pages.count - 1, 0), capacityPerPage: capacity)
+            }
+        }
+        store.applyActiveSort()
+    }
+
     // MARK: 排序方式
 
     /// 切换排序方式并立即全局重排（Custom 保持现有布局不重排）。
@@ -79,6 +102,19 @@ public final class PreferencesModel {
     /// 切换升序 / 降序并立即全局重排（固定方向键无此开关，调用方负责隐藏）。
     public func applySortAscending(_ ascending: Bool) {
         update { $0.sortAscending = ascending }
+        store.applyActiveSort()
+    }
+
+    /// 摆放规则（文件夹位置）只在 `applyActiveSort` 里被读取：改完必须立即重排，
+    /// 否则设置与网格不一致，要等下次重扫/启动才生效。
+    public func setFolderPosition(_ position: FolderPosition) {
+        update { $0.folderPosition = position }
+        store.applyActiveSort()
+    }
+
+    /// 摆放规则（Apple 应用位置），同上。
+    public func setAppleAppsPosition(_ position: AppleAppsPosition) {
+        update { $0.appleAppsPosition = position }
         store.applyActiveSort()
     }
 
@@ -122,13 +158,15 @@ public final class PreferencesModel {
     /// 除指定入口外是否还存在其它可用入口。
     public func hasAlternativeEntry(excluding kind: EntryKind, in settings: AppSettings? = nil) -> Bool {
         let s = settings ?? store.state.settings
+        // 原始触点手势通道无需任何权限，开关即有效入口。
+        let gestureEntry = TrackpadTouchMonitor.isEntryAvailable(enabled: s.pinchGestureEnabled)
         switch kind {
         case .menuBarIcon:
-            return s.hotKey != .none || s.pinchGesture != .off || s.showDockIcon
+            return s.hotKey != .none || gestureEntry || s.showDockIcon
         case .dockIcon:
-            return s.hotKey != .none || s.pinchGesture != .off || s.showMenuBarIcon
+            return s.hotKey != .none || gestureEntry || s.showMenuBarIcon
         case .hotKey:
-            return s.pinchGesture != .off || s.showMenuBarIcon || s.showDockIcon
+            return gestureEntry || s.showMenuBarIcon || s.showDockIcon
         case .pinchGesture:
             return s.hotKey != .none || s.showMenuBarIcon || s.showDockIcon
         }
@@ -137,11 +175,12 @@ public final class PreferencesModel {
     /// 当前是否至少有一个唤起入口（AppDelegate 兜底判定同一逻辑）。
     public var hasAnyEntry: Bool {
         let s = store.state.settings
-        return s.showMenuBarIcon || s.showDockIcon || s.hotKey != .none || s.pinchGesture != .off
+        return s.showMenuBarIcon || s.showDockIcon || s.hotKey != .none
+            || TrackpadTouchMonitor.isEntryAvailable(enabled: s.pinchGestureEnabled)
     }
 
     private func blockLastEntry() {
-        ToastManager.shared.error("无法关闭：这是最后一个唤起入口，关闭后将无法再打开 LaunchX。请先配置快捷键、开启捏合手势，或保留菜单栏 / Dock 图标。")
+        ToastManager.shared.error("无法关闭：至少保留一个唤起入口（快捷键、手势或图标）。")
     }
 
     public func setMenuBarIconVisible(_ visible: Bool) {
@@ -160,12 +199,12 @@ public final class PreferencesModel {
         update { $0.showDockIcon = visible }
     }
 
-    public func setPinchGesture(_ mode: PinchGesture) {
-        guard mode != .off || hasAlternativeEntry(excluding: .pinchGesture) else {
+    public func setPinchGestureEnabled(_ enabled: Bool) {
+        guard enabled || hasAlternativeEntry(excluding: .pinchGesture) else {
             blockLastEntry()
             return
         }
-        update { $0.pinchGesture = mode }
+        update { $0.pinchGestureEnabled = enabled }
     }
 
     // MARK: 来源管理
@@ -184,11 +223,7 @@ public final class PreferencesModel {
             return
         }
         let affected = affectedAppCount(for: source)
-        guard confirmSourceChange(
-            title: "删除来源「\(displayName(for: source))」？",
-            affected: affected,
-            extra: "删除后需重新添加该目录才能再次扫描到其中的应用。"
-        ) else { return }
+        guard confirmSourceChange(title: "删除来源「\(displayName(for: source))」？", affected: affected) else { return }
         updateSources { $0.removeAll { $0.id == id } }
     }
 
@@ -236,14 +271,14 @@ public final class PreferencesModel {
         source.kind == .defaultApps ? SourceConfig.defaultAppsDirectories() : [source.path]
     }
 
-    /// 来源变更确认弹窗：明确列出受影响的已摆放应用数量与不可恢复的后果。
-    private func confirmSourceChange(title: String, affected: Int, extra: String) -> Bool {
+    /// 来源变更确认弹窗：明确列出受影响的已摆放应用数量；后果不显然时用 extra 补一句。
+    private func confirmSourceChange(title: String, affected: Int, extra: String? = nil) -> Bool {
         let alert = NSAlert()
         alert.messageText = title
         let consequence = affected > 0
             ? "将从启动台移除该来源下的 \(affected) 个应用，其排序位置、文件夹归类与隐藏状态会被清除。"
             : "该来源下没有已摆放的应用，不会影响当前布局。"
-        alert.informativeText = "\(consequence)\n\(extra)"
+        alert.informativeText = extra.map { "\(consequence)\n\($0)" } ?? consequence
         alert.addButton(withTitle: "继续")
         alert.addButton(withTitle: "取消")
         NSApp.activate(ignoringOtherApps: true)
@@ -296,6 +331,8 @@ public final class PreferencesWindowController: NSObject, NSWindowDelegate {
             window = newWindow
         }
         guard let window else { return }
+        // 面板是全屏 statusBar 层级：面板可见时子窗口必须抬到它之上，否则会被完全遮住。
+        window.level = LaunchpadWindowController.childWindowLevel
         NSApp.activate(ignoringOtherApps: true)
         WindowFade.fadeIn(window)
     }
@@ -310,19 +347,66 @@ public final class PreferencesWindowController: NSObject, NSWindowDelegate {
 /// 设置根视图：4 标签页（通用/应用/界面/关于）。
 struct PreferencesRootView: View {
     @Environment(PreferencesModel.self) private var prefs
+    /// 用户去系统设置授权后切回来：重算一次 body，让「需要权限 / 待批准」提示即时消失。
+    /// 这两个状态来自 AXIsProcessTrusted / SMAppService，都不是可观察对象。
+    @State private var permissionRefreshTick = 0
 
     var body: some View {
-        TabView {
-            GeneralSettingsTab().tabItem { Label("通用", systemImage: "gearshape") }
-            AppsSettingsTab().tabItem { Label("应用", systemImage: "square.grid.2x2") }
-            InterfaceSettingsTab().tabItem { Label("界面", systemImage: "paintbrush") }
-            InfoSettingsTab().tabItem { Label("关于", systemImage: "info.circle") }
+        let _ = permissionRefreshTick
+        VStack(spacing: 8) {
+            // 只读模式横幅：更高版本写入的配置无法保存，必须让用户看见
+            if let notice = prefs.store.futureVersionReadOnlyNotice {
+                Label(notice, systemImage: "lock.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+            }
+            TabView {
+                GeneralSettingsTab().tabItem { Label("通用", systemImage: "gearshape") }
+                AppsSettingsTab().tabItem { Label("应用", systemImage: "square.grid.2x2") }
+                InterfaceSettingsTab().tabItem { Label("界面", systemImage: "paintbrush") }
+                InfoSettingsTab().tabItem { Label("关于", systemImage: "info.circle") }
+            }
         }
         .padding(16)
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            permissionRefreshTick &+= 1
+        }
     }
 }
 
 // MARK: - 通用 General
+
+/// 需要用户到系统设置操作时的行内替代文案：一句状态 + 直达对应面板的按钮。
+struct SystemSettingsActionRow: View {
+    let icon: String
+    let status: String
+    let action: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Label(status, systemImage: icon)
+                .font(.system(size: 12))
+                .foregroundStyle(.orange)
+            Spacer()
+            Button("打开系统设置", action: action)
+                .controlSize(.small)
+        }
+    }
+}
+
+/// 系统设置面板跳转。
+enum SystemSettingsPane {
+    /// 隐私与安全性 → 辅助功能（捏合手势需要）。
+    static func openAccessibility() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+    }
+    /// 通用 → 登录项（开机启动审批）。
+    static func openLoginItems() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension")!)
+    }
+}
 
 struct GeneralSettingsTab: View {
     @Environment(PreferencesModel.self) private var prefs
@@ -330,28 +414,18 @@ struct GeneralSettingsTab: View {
 
     var body: some View {
         Form {
-            Section("快捷键") {
+            Section("唤起") {
                 HotKeyRecorderRow()
-            }
-
-            Section("触控板手势") {
-                Picker("捏合唤起", selection: Binding(
-                    get: { settings.pinchGesture },
-                    set: { prefs.setPinchGesture($0) }
-                )) {
-                    ForEach(PinchGesture.allCases, id: \.self) { mode in
-                        Text(mode.label).tag(mode)
-                    }
-                }
-                if settings.pinchGesture != .off {
-                    Label("张开手指打开窗口，捏合手指收起（与系统 Launchpad 手势习惯一致）。", systemImage: "hand.draw")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                }
-                if settings.pinchGesture != .off && !TrackpadGestureMonitor.hasPermission {
-                    Label("需要「辅助功能」权限：系统设置 → 隐私与安全性 → 辅助功能", systemImage: "lock")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.orange)
+                Toggle("捏合唤起（四指）", isOn: Binding(
+                    get: { settings.pinchGestureEnabled },
+                    set: { prefs.setPinchGestureEnabled($0) }
+                ))
+                if settings.pinchGestureEnabled && !TrackpadTouchMonitor.hasPermission {
+                    SystemSettingsActionRow(
+                        icon: "lock.open.fill",
+                        status: "可选：授予「辅助功能」权限后，捏合唤起时会同时抑制系统启动台手势（避免双开）",
+                        action: SystemSettingsPane.openAccessibility
+                    )
                 }
             }
 
@@ -368,36 +442,20 @@ struct GeneralSettingsTab: View {
                     }
                 ))
                 if LoginItemService.needsApproval {
-                    Label("已请求开机启动，请在系统设置 → 通用 → 登录项中批准。", systemImage: "hourglass")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.orange)
+                    SystemSettingsActionRow(
+                        icon: "hourglass",
+                        status: "待系统批准开机启动",
+                        action: SystemSettingsPane.openLoginItems
+                    )
                 }
                 Toggle("显示菜单栏图标", isOn: Binding(
                     get: { settings.showMenuBarIcon },
                     set: { prefs.setMenuBarIconVisible($0) }
                 ))
-                if settings.showMenuBarIcon {
-                    Label("左键点按菜单栏图标展开启动台，右键显示功能菜单。", systemImage: "cursorarrow.click.2")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                }
                 Toggle("显示程序坞图标", isOn: Binding(
                     get: { settings.showDockIcon },
                     set: { prefs.setDockIconVisible($0) }
                 ))
-                if settings.showDockIcon {
-                    Label("勾选后 LaunchX 会固定在程序坞前部（第 3 个位置）。", systemImage: "dock.rectangle")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                }
-                if !settings.showMenuBarIcon && !settings.showDockIcon {
-                    Label(
-                        "两个图标都关闭后，只能靠快捷键 / 触控板手势唤起；若再关闭这些入口，设置会阻止操作，避免应用失联。",
-                        systemImage: "exclamationmark.triangle"
-                    )
-                    .font(.system(size: 11))
-                    .foregroundStyle(.orange)
-                }
             }
         }
         .formStyle(.grouped)
@@ -559,9 +617,17 @@ struct HotKeyRecorderControl: NSViewRepresentable {
         }
 
         override func keyDown(with event: NSEvent) {
+            // 录制结束后控件仍是 first responder：不设这道闸，之后在设置窗里敲的任意键
+            //（Tab/方向键/字母）都会被当成一次新录制——要么弹「快捷键无效」，要么静默换绑热键。
+            guard recording else {
+                super.keyDown(with: event)
+                return
+            }
             defer {
                 recording = false
                 onRecordingChanged?(false)
+                // 录完主动交还第一响应者，让后续按键回到正常控件导航。
+                window?.makeFirstResponder(nil)
             }
             // Esc 取消
             if event.keyCode == KeyCodes.kVK_Escape {

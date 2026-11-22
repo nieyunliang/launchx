@@ -193,4 +193,29 @@ struct SourceConfigTests {
         let migrated = SourceConfig.migratingLegacyDefaults(custom)
         #expect(migrated == custom)
     }
+
+    @Test func migrationKeepsCustomSourceOnLegacyDefaultPath() {
+        // 用户把 ~/Applications（旧版默认路径之一）显式添加为自定义来源：
+        // 迁移按 kind 判定，不得按路径把它删掉（否则每次启动都会静默吞掉该来源）
+        let homeApps = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Applications").path
+        let migrated = SourceConfig.migratingLegacyDefaults([
+            SourceConfig.defaultApps(),
+            SourceConfig(path: homeApps, kind: .custom),
+        ])
+        #expect(migrated.count == 2)
+        #expect(migrated.contains { $0.kind == .custom && $0.path == homeApps })
+        #expect(migrated.contains { $0.kind == .defaultApps })
+    }
+
+    @Test func migrationPreservesDisabledBuiltinState() {
+        // 内置「应用程序」若被用户关闭，迁移不得重新启用
+        let migrated = SourceConfig.migratingLegacyDefaults([
+            SourceConfig(path: "/Applications", enabled: false, kind: .defaultApps),
+            SourceConfig(path: "/Applications", enabled: true, kind: .userApps),
+        ])
+        #expect(migrated.count == 1)
+        #expect(migrated[0].kind == .defaultApps)
+        #expect(migrated[0].enabled == false)
+    }
 }

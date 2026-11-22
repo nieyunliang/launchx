@@ -89,10 +89,21 @@ public enum UninstallScanner {
         let bundleID = app.bundleId ?? ""
         let name = app.name
 
+        /// 允许清理的根目录。删除路径必须落在这些根之下（目录边界匹配），
+        /// 否则一个畸形 bundle（如 `CFBundleIdentifier = "../.."`）会让清单指向家目录本身。
+        let allowedRoots = [
+            home,
+            URL(fileURLWithPath: "/Library", isDirectory: true),
+            URL(fileURLWithPath: "/Applications", isDirectory: true),
+        ]
+
         func existing(_ path: String) -> URL? {
             var isDirectory: ObjCBool = false
             guard fileManager.fileExists(atPath: path, isDirectory: &isDirectory) else { return nil }
-            return URL(fileURLWithPath: path, isDirectory: isDirectory.boolValue)
+            let url = URL(fileURLWithPath: path, isDirectory: isDirectory.boolValue)
+            // 防御：`..` 越界（或指向允许根之外的绝对路径）的条目一律不收集。
+            guard Self.isContainedInAllowedRoots(url, roots: allowedRoots) else { return nil }
+            return url
         }
 
         /// 记录一个命中项。`speculative` = 由名称模糊匹配得到、不保证属于该应用。
@@ -106,25 +117,34 @@ public enum UninstallScanner {
             ))
         }
 
+        // 路径拼接用的分量必须是单个安全文件名：bundleId / 显示名来自 bundle 的 Info.plist，
+        // 出现 `/`、`..` 等分量时会构造出越界路径（兜底在 existing()，这里先挡一层）。
+        let bundleComponent = Self.safePathComponent(bundleID)
+        let nameComponent = Self.safePathComponent(name)
+
         // Caches（bundleId 精确路径可直接归因；按应用名命名的缓存目录属于模糊匹配）
-        if !bundleID.isEmpty {
-            add(existing(library.appendingPathComponent("Caches/\(bundleID)").path), .caches)
+        if let bundleComponent {
+            add(existing(library.appendingPathComponent("Caches/\(bundleComponent)").path), .caches)
         }
-        add(existing(library.appendingPathComponent("Caches/\(name)").path), .caches, speculative: true)
+        if let nameComponent {
+            add(existing(library.appendingPathComponent("Caches/\(nameComponent)").path), .caches, speculative: true)
+        }
 
         // Application Support
-        if !bundleID.isEmpty {
-            add(existing(library.appendingPathComponent("Application Support/\(bundleID)").path), .applicationSupport)
+        if let bundleComponent {
+            add(existing(library.appendingPathComponent("Application Support/\(bundleComponent)").path), .applicationSupport)
         }
-        add(
-            existing(library.appendingPathComponent("Application Support/\(name)").path),
-            .applicationSupport,
-            speculative: true
-        )
+        if let nameComponent {
+            add(
+                existing(library.appendingPathComponent("Application Support/\(nameComponent)").path),
+                .applicationSupport,
+                speculative: true
+            )
+        }
 
         // Containers
-        if !bundleID.isEmpty {
-            add(existing(library.appendingPathComponent("Containers/\(bundleID)").path), .containers)
+        if let bundleComponent {
+            add(existing(library.appendingPathComponent("Containers/\(bundleComponent)").path), .containers)
         }
 
         // Group Containers（group.<team>.<id>，按 bundleId 尾缀匹配）
@@ -135,10 +155,12 @@ public enum UninstallScanner {
         }
 
         // Application Files：~/Library/<name>、Logs（按名称匹配，可能同名误伤）
-        add(existing(library.appendingPathComponent("\(name)").path), .applicationFiles, speculative: true)
-        add(existing(library.appendingPathComponent("Logs/\(name)").path), .applicationFiles, speculative: true)
-        if !bundleID.isEmpty {
-            add(existing(library.appendingPathComponent("Logs/\(bundleID)").path), .applicationFiles)
+        if let nameComponent {
+            add(existing(library.appendingPathComponent("\(nameComponent)").path), .applicationFiles, speculative: true)
+            add(existing(library.appendingPathComponent("Logs/\(nameComponent)").path), .applicationFiles, speculative: true)
+        }
+        if let bundleComponent {
+            add(existing(library.appendingPathComponent("Logs/\(bundleComponent)").path), .applicationFiles)
         }
 
         // User Files：~/Documents、~/Downloads 浅层名称匹配。
@@ -151,21 +173,25 @@ public enum UninstallScanner {
             }
         }
 
-        // Other Files：Preferences plist
+        // Other Files：Preferences plist。
+        // 必须按目录边界匹配：`hasPrefix(bundleID)` 会把 `com.foo` 的卸载连带勾选
+        // `com.foobar.plist`（另一个应用的偏好设置）。只有 `bundleID.plist` 直接归因，
+        // `bundleID.` 前缀（helper/子模块）降级为「可能相关」默认不勾选。
         if !bundleID.isEmpty {
             let prefs = library.appendingPathComponent("Preferences", isDirectory: true)
             let plists = (try? fileManager.contentsOfDirectory(atPath: prefs.path)) ?? []
-            for plist in plists where plist.hasPrefix(bundleID) {
-                add(existing(prefs.appendingPathComponent(plist).path), .otherFiles)
+            for plist in plists where Self.preferenceBelongsTo(plist, bundleID: bundleID) {
+                let exact = plist == "\(bundleID).plist"
+                add(existing(prefs.appendingPathComponent(plist).path), .otherFiles, speculative: !exact)
             }
         }
 
         // WebKit Data / HTTP Storage / Saved State / Application Scripts
-        if !bundleID.isEmpty {
-            add(existing(library.appendingPathComponent("WebKit/\(bundleID)").path), .webKitData)
-            add(existing(library.appendingPathComponent("HTTPStorages/\(bundleID)").path), .httpStorage)
-            add(existing(library.appendingPathComponent("Saved Application State/\(bundleID).savedState").path), .savedState)
-            add(existing(library.appendingPathComponent("Application Scripts/\(bundleID)").path), .applicationScripts)
+        if let bundleComponent {
+            add(existing(library.appendingPathComponent("WebKit/\(bundleComponent)").path), .webKitData)
+            add(existing(library.appendingPathComponent("HTTPStorages/\(bundleComponent)").path), .httpStorage)
+            add(existing(library.appendingPathComponent("Saved Application State/\(bundleComponent).savedState").path), .savedState)
+            add(existing(library.appendingPathComponent("Application Scripts/\(bundleComponent)").path), .applicationScripts)
         }
 
         // Launch Items
@@ -204,9 +230,9 @@ public enum UninstallScanner {
         }
 
         // Sandbox：容器元数据（独立于 Containers 主体，作为最后防线类目）
-        if !bundleID.isEmpty {
+        if let bundleComponent {
             add(
-                existing(library.appendingPathComponent("Containers/\(bundleID)/.com.apple.containermanagerd.metadata.plist").path),
+                existing(library.appendingPathComponent("Containers/\(bundleComponent)/.com.apple.containermanagerd.metadata.plist").path),
                 .sandbox
             )
         }
@@ -218,9 +244,55 @@ public enum UninstallScanner {
         return items
     }
 
+    // MARK: - 路径安全
+
+    /// 允许清理的根目录（删除/收集都必须落在这些目录之下）。`home` 之外的系统级根
+    /// 只包含 `/Library` 与 `/Applications`：扫描器本身只会产出这两处的自启项与替身。
+    static func allowedRoots(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> [URL] {
+        [
+            home.standardizedFileURL,
+            URL(fileURLWithPath: "/Library", isDirectory: true),
+            URL(fileURLWithPath: "/Applications", isDirectory: true),
+        ]
+    }
+
+    /// URL 是否落在给定根目录之内（目录边界匹配，根目录本身视为「不允许」）。
+    ///
+    /// 用 `standardizedFileURL` 先把 `..` 分子消掉；不解析符号链接（回收站删除的是链接本身）。
+    public static func isContainedInAllowedRoots(_ url: URL, roots: [URL]) -> Bool {
+        let target = url.standardizedFileURL.path
+        guard !target.isEmpty, target != "/" else { return false }
+        for root in roots {
+            let rootPath = root.standardizedFileURL.path
+            guard !rootPath.isEmpty, rootPath != "/" else { continue }
+            if target == rootPath { return false }
+            let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
+            if target.hasPrefix(prefix) { return true }
+        }
+        return false
+    }
+
+    /// 单个路径分量是否安全：非空、不含 `/`、`\0`、`: ` 与 `.` / `..`。
+    static func safePathComponent(_ raw: String) -> String? {
+        guard !raw.isEmpty,
+              raw != ".", raw != "..",
+              !raw.contains("/"),
+              !raw.contains("\0"),
+              !raw.contains(":") else { return nil }
+        return raw
+    }
+
+    /// Preferences 目录里的 plist 是否属于该 bundleId（目录边界匹配）。
+    /// `com.foo` 只直接归因 `com.foo.plist`；`com.foo.bar.plist`（helper/子模块）允许命中但调用方降级为「可能相关」。
+    static func preferenceBelongsTo(_ plist: String, bundleID: String) -> Bool {
+        guard !bundleID.isEmpty else { return false }
+        return plist == "\(bundleID).plist" || plist.hasPrefix("\(bundleID).")
+    }
+
     /// 目录/文件大小（目录递归；失败 nil）。
-    public static func size(of url: URL, fileManager: FileManager = .default) -> Int64? {
-        var isDirectory: ObjCBool = false
+    public static func size(of url: URL, fileManager: FileManager = .default) -> Int64? {        var isDirectory: ObjCBool = false
         guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) else { return nil }
         if !isDirectory.boolValue {
             if let attrs = try? fileManager.attributesOfItem(atPath: url.path),
@@ -264,6 +336,14 @@ public enum UninstallEngine {
         try await NSWorkspace.shared.recycle(urls)
     }
 
+    /// 删除侧安全校验：路径必须落在 `home` / `/Library` / `/Applications` 之内。
+    public static func isSafeToTrash(
+        _ url: URL,
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> Bool {
+        UninstallScanner.isContainedInAllowedRoots(url, roots: UninstallScanner.allowedRoots(home: home))
+    }
+
     /// 删除选中项（移到废纸篓）。
     ///
     /// 失败逐条收集（含单项抛错与「未出现在回收站返回字典中」两种情形）；
@@ -271,6 +351,7 @@ public enum UninstallEngine {
     @discardableResult
     public static func remove(
         items: [UninstallItem],
+        home: URL = FileManager.default.homeDirectoryForCurrentUser,
         trash: TrashHandler = UninstallEngine.systemTrash,
         onEvent: @MainActor @escaping (Outcome) -> Void
     ) async -> (trashed: Int, failed: [(path: String, error: String)]) {
@@ -279,6 +360,16 @@ public enum UninstallEngine {
         let fileManager = FileManager.default
 
         for (index, item) in items.enumerated() {
+            // 最后一道闸：任何不在允许根目录内的路径都不交给回收站。
+            // 扫描侧已做同样校验，这里防的是调用方传入的手工条目 / 扫描后路径被替换。
+            guard isSafeToTrash(item.url, home: home) else {
+                failed.append((item.url.path, "路径不在允许的清理范围内，已跳过"))
+                let done = index + 1
+                await MainActor.run {
+                    onEvent(.progress(done: done, total: items.count))
+                }
+                continue
+            }
             if !fileManager.fileExists(atPath: item.url.path) {
                 // 扫描之后已被其它途径移除：无可删内容，既不算成功也不算失败
             } else {

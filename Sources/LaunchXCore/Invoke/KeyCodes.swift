@@ -1,4 +1,22 @@
 import AppKit
+import Carbon.HIToolbox
+
+/// 当前键盘输入源能力查询。
+///
+/// 「输入即搜索」在面板层直接消费首个可打印字符：英文键盘没问题，但中文/日文等
+/// 输入法（IME）的首键会被当成原始字母写进查询，之后 IME 从第二个键才开始组字，
+/// 查询永远匹配不到目标应用。因此需要知道当前输入源能否直接产生 ASCII。
+public enum InputSource {
+    /// 当前键盘输入源是否可直接输入 ASCII（英文键盘为 true，中文/日文等 IME 为 false）。
+    nonisolated public static var isASCIICapable: Bool {
+        guard let source = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue() else { return true }
+        guard let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceIsASCIICapable) else {
+            return true
+        }
+        let flag = Unmanaged<CFBoolean>.fromOpaque(raw).takeUnretainedValue()
+        return CFBooleanGetValue(flag)
+    }
+}
 
 /// 虚拟键码 / 修饰键工具（纯函数，无状态，重点可测）。
 ///
@@ -73,7 +91,8 @@ public enum KeyCodes {
         var carbon: UInt32 = 0
         if flags.contains(.command) { carbon |= cmdKey }
         if flags.contains(.shift) { carbon |= shiftKey }
-        if flags.contains(.capsLock) { carbon |= alphaLock }
+        // CapsLock 的 alphaLock 是键盘状态位、不是热键修饰键：映射进去会让掩码带着锁定位，
+        // 导致校验的精确相等判断全部失效，且注册出的热键在 Caps Lock 关闭时永不触发。
         if flags.contains(.option) { carbon |= optionKey }
         if flags.contains(.control) { carbon |= controlKey }
         return carbon
@@ -97,6 +116,11 @@ public enum KeyCodes {
         "⌘⇧Space": HotKeySpec(keyCode: 49, modifiers: cmdKey | shiftKey),
         "⌥⇧Space": HotKeySpec(keyCode: 49, modifiers: optionKey | shiftKey),
         "F6": HotKeySpec(keyCode: 97, modifiers: 0),
+    ]
+
+    /// F1–F15 的虚拟键码（ANSI）。功能键允许任意修饰组合，包括无修饰。
+    static let functionKeyCodes: Set<UInt32> = [
+        122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111, 105, 107, 113,
     ]
 
     /// Esc 键虚拟键码（录制器取消用）。
@@ -124,8 +148,10 @@ public enum KeyCodes {
         if nonShortcutKeyCodes.contains(spec.keyCode) {
             return "回车、Tab、Esc、删除与方向键不能单独作为快捷键"
         }
-        // 功能键（F1–F15）任意组合都安全
-        if string(for: spec.keyCode)?.hasPrefix("F") == true {
+        // 功能键（F1–F15）任意组合都安全。
+        // 必须用键码集合判定：显示名以 "F" 开头的不只有 F1–F15，字母 F 的显示名也是 "F"，
+        // 用 hasPrefix 会让裸 F / ⌘F / ⌥F 绕过下面所有拦截（裸 F 会在任何应用里切出启动台）。
+        if functionKeyCodes.contains(spec.keyCode) {
             return nil
         }
         if spec.modifiers == 0 {

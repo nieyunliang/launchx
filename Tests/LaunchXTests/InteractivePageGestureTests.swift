@@ -142,6 +142,35 @@ struct InteractivePageGestureTests {
         #expect(InteractivePageGesture.shouldForward(deltaX: 10, deltaY: 3, isGestureBoundary: false))  // 正常横滑
     }
 
+    @Test func continuousGestureEventsAreAlwaysForwardedInPagedMode() {
+        // 回归（不丝滑）：分页浏览下连续手势的全部事件必须上报——过滤层不知道
+        // 跟手是否已在进行，逐事件丢弃小增量（触控板高采样率下慢滑常为 1-2pt）
+        // 与纵向为主的抖动事件，会让 1:1 跟手退化成断续位移。
+        #expect(InteractivePageGesture.shouldForward(
+            deltaX: 1, deltaY: 0, isGestureBoundary: false,
+            isContinuousGesture: true, isPagedBrowsing: true
+        ))
+        #expect(InteractivePageGesture.shouldForward(
+            deltaX: 0.5, deltaY: 8, isGestureBoundary: false,  // 纵向抖动也不丢
+            isContinuousGesture: true, isPagedBrowsing: true
+        ))
+        #expect(InteractivePageGesture.shouldForward(  // 惯性事件上报（下游 feed 忽略）
+            deltaX: 0, deltaY: 0, isGestureBoundary: false,
+            isContinuousGesture: true, isPagedBrowsing: true
+        ))
+        // 非分页浏览（滚动模式 / 搜索 / 文件夹）保持方向与幅度过滤：
+        // 纵向滚动事件要放行给内层 ScrollView
+        #expect(!InteractivePageGesture.shouldForward(
+            deltaX: 1, deltaY: 8, isGestureBoundary: false,
+            isContinuousGesture: true, isPagedBrowsing: false
+        ))
+        // 离散滚轮事件不属于连续手势，分页下仍按幅度过滤（防误触微滚动）
+        #expect(!InteractivePageGesture.shouldForward(
+            deltaX: 1, deltaY: 0, isGestureBoundary: false,
+            isContinuousGesture: false, isPagedBrowsing: true
+        ))
+    }
+
     @Test func endedEventDoesNotDiluteVelocity() {
         var g = InteractivePageGesture()
         // 高速甩动后接零增量 .ended：速度不应被冲淡

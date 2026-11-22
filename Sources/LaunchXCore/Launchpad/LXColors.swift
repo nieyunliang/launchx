@@ -46,7 +46,7 @@ public enum LXColors {
     public static func newBadge(_ dark: Bool) -> Color {
         dark
             ? Color(red: 0xFF / 255.0, green: 0x61 / 255.0, blue: 0x5C / 255.0)
-            : Color(red: 0xF1 / 255.0, green: 0x1F / 255.0, blue: 0x14 / 255.0)
+            : Color(red: 0xF1 / 255.0, green: 0x38 / 255.0, blue: 0x3D / 255.0)
     }
 
     /// 当前是否暗色外观。
@@ -83,10 +83,13 @@ public extension View {
 // MARK: - 玻璃材质
 
 /// GlassMaterial → NSVisualEffectView.Material。
+///
+/// 「关闭」返回 nil：调用方应改用纯色叠层而不创建 `NSVisualEffectView`
+/// （旧映射把 off 与 thin 都指向 `.underWindowBackground`，两者观感完全相同）。
 public extension GlassMaterial {
-    var material: NSVisualEffectView.Material {
+    var material: NSVisualEffectView.Material? {
         switch self {
-        case .off: .underWindowBackground
+        case .off: nil
         case .thin: .underWindowBackground
         case .regular: .sidebar
         case .thick: .fullScreenUI

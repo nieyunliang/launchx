@@ -178,6 +178,7 @@ struct UninstallEngineTests {
 
         let result = await UninstallEngine.remove(
             items: items,
+            home: dir,
             trash: { urls in
                 // 回收站只接受第一个文件：未出现在返回字典里的项即失败
                 var moved: [URL: URL] = [:]
@@ -210,6 +211,7 @@ struct UninstallEngineTests {
 
         let result = await UninstallEngine.remove(
             items: items,
+            home: dir,
             trash: { _ in throw StubError.recycleFailed },
             onEvent: { _ in }
         )
@@ -241,10 +243,12 @@ struct PreferencesEntryGuardTests {
 
     @Test func blocksClosingMenuBarIconWhenItIsTheLastEntry() {
         let (store, prefs) = makePreferences()
-        // 默认：仅菜单栏图标；热键未设置、捏合关闭、Dock 图标关闭
+        // 显式关掉手势开关：不依赖测试宿主是否碰巧持有辅助功能权限（有权限时
+        // 默认开启的手势也算有效入口，菜单栏就不是「最后一个入口」了）。
+        store.updateSettings { $0.pinchGestureEnabled = false }
         #expect(store.state.settings.showMenuBarIcon)
         #expect(store.state.settings.hotKey == .none)
-        #expect(store.state.settings.pinchGesture == .off)
+        #expect(!store.state.settings.pinchGestureEnabled)
         #expect(!store.state.settings.showDockIcon)
 
         prefs.setMenuBarIconVisible(false)
@@ -268,7 +272,7 @@ struct PreferencesEntryGuardTests {
         store.updateSettings {
             $0.showMenuBarIcon = false
             $0.showDockIcon = false
-            $0.pinchGesture = .off
+            $0.pinchGestureEnabled = false
             $0.hotKey = HotKeySpec(keyCode: 49, modifiers: 0x0100)
         }
 
@@ -283,12 +287,12 @@ struct PreferencesEntryGuardTests {
             $0.showMenuBarIcon = false
             $0.showDockIcon = false
             $0.hotKey = .none
-            $0.pinchGesture = .fourFinger
+            $0.pinchGestureEnabled = true
         }
 
-        prefs.setPinchGesture(.off)
+        prefs.setPinchGestureEnabled(false)
         ToastManager.shared.dismissAll()
-        #expect(store.state.settings.pinchGesture == .fourFinger)  // 拒绝关闭
+        #expect(store.state.settings.pinchGestureEnabled)  // 拒绝关闭
     }
 
     @Test func allowsDisablingEntryWhenDockIconRemains() {

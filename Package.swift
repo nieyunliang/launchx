@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "LaunchX",
-    platforms: [.macOS(.v27)],
+    platforms: [.macOS(.v26)],
     products: [
         .library(name: "LaunchXCore", targets: ["LaunchXCore"]),
     ],

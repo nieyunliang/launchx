@@ -342,8 +342,31 @@ struct LaunchpadModelTests {
 
         model.createNewFolderOnCurrentPage()
 
+        // 页面被补回，但当前页没有应用时不再创建空文件夹占位
+        // （布局不变量：空文件夹不允许存在）
         #expect(store.state.layout.pages.count == 1)
-        #expect(store.state.layout.pages[0].items.compactMap(\.folder).count == 1)
+        #expect(store.state.layout.pages[0].items.isEmpty)
+    }
+
+    @Test func createNewFolderCollectsLastAppOnCurrentPage() {
+        let dir = tempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = LayoutStore(directory: dir)
+        let model = LaunchpadModel(store: store)
+        store.updateLayout { layout in
+            layout.apps["a"] = makeApp("a")
+            layout.apps["b"] = makeApp("b")
+            layout.pages = [PageRecord(items: [.app(id: "a"), .app(id: "b")])]
+        }
+
+        model.createNewFolderOnCurrentPage()
+
+        let items = store.state.layout.pages[0].items
+        #expect(items.count == 2)
+        #expect(items[0].appID == "a")
+        let folder = items[1].folder
+        #expect(folder?.appIDs == ["b"])
+        #expect(folder?.name == "新建文件夹")
     }
 
     @Test func mergeSelectionRecreatesPageWhenLayoutHasNone() {
