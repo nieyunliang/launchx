@@ -2,6 +2,7 @@ import AppKit
 import CoreGraphics
 import Darwin
 import Foundation
+import IOKit
 import OSLog
 import QuartzCore
 import os
@@ -27,8 +28,12 @@ import os
 //   切窗口消费的正是这些载荷帧：若按「≥3 触点」一律吞帧，三指滑动切窗口整体
 //   失效（2026-11-21 真机日志实锤，已回归）。双指缩放（2 触点）永不构成会话，
 //   缩放不受影响。
-// - 效率：单指空闲帧（光标移动/单指滚动）不进主线程，125Hz 只在多触活动或
-//   触点数变化时转发；抑制 tap 跑在专用线程，吞帧决策不被主线程 UI 阻塞。
+// - 效率：单指空闲帧（光标移动/单指滚动）不跑识别器，125Hz 只在多触活动或
+//   触点数变化时识别；识别器同步跑在 MT 回调线程（主线程拥塞不拖慢否决决策），
+//   事件经邮箱合并后投递主线程；抑制 tap 跑在专用线程，吞帧决策不被主线程
+//   UI 阻塞。
+// - 多设备（O10）：MTDeviceCreateList 枚举内建 + 外接触控板，每设备独立
+//   识别 pipeline；IOKit 热插拔通知 + 睡眠唤醒自愈触发设备重启。
 // - 辅助功能权限仅抑制 tap 需要：无权限时手势照常可用，只是真捏合期间系统侧
 //   启动台手势可能同时响应（UI 文案按「可选」表述）。
 
@@ -511,10 +516,12 @@ final class MultitouchBridge {
     let handle: UnsafeMutableRawPointer
     let isAvailable: @convention(c) () -> Bool
     let createDefault: @convention(c) () -> UnsafeMutableRawPointer?
+    /// 返回 CFArrayRef（本机全部 MT 设备）。社区逆向的可选符号：缺失时
+    /// 退化为仅默认设备（O10），不影响主流程。
+    let createList: (@convention(c) () -> UnsafeMutableRawPointer?)?
     let registerContactFrame: @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Void
     let start: @convention(c) (UnsafeMutableRawPointer?, Int32) -> Int32
     let stop: @convention(c) (UnsafeMutableRawPointer?) -> Int32
-    let release: @convention(c) (UnsafeMutableRawPointer?) -> Void
     let isRunning: @convention(c) (UnsafeMutableRawPointer?) -> Bool
 
     static let frameworkPath = "/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport"
@@ -533,7 +540,6 @@ final class MultitouchBridge {
             let registerContactFrame = sym("MTRegisterContactFrameCallback"),
             let start = sym("MTDeviceStart"),
             let stop = sym("MTDeviceStop"),
-            let release = sym("MTDeviceRelease"),
             let isRunning = sym("MTDeviceIsRunning")
         else {
             logger.warning("MultitouchSupport 符号缺失，手势入口停用")
@@ -547,10 +553,12 @@ final class MultitouchBridge {
             handle: handle,
             isAvailable: unsafeBitCast(isAvailable, to: (@convention(c) () -> Bool).self),
             createDefault: unsafeBitCast(createDefault, to: (@convention(c) () -> UnsafeMutableRawPointer?).self),
+            createList: sym("MTDeviceCreateList").map {
+                unsafeBitCast($0, to: (@convention(c) () -> UnsafeMutableRawPointer?).self)
+            },
             registerContactFrame: unsafeBitCast(registerContactFrame, to: (@convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Void).self),
             start: unsafeBitCast(start, to: (@convention(c) (UnsafeMutableRawPointer?, Int32) -> Int32).self),
             stop: unsafeBitCast(stop, to: (@convention(c) (UnsafeMutableRawPointer?) -> Int32).self),
-            release: unsafeBitCast(release, to: (@convention(c) (UnsafeMutableRawPointer?) -> Void).self),
             isRunning: unsafeBitCast(isRunning, to: (@convention(c) (UnsafeMutableRawPointer?) -> Bool).self)
         )
         cached = bridge
@@ -561,19 +569,19 @@ final class MultitouchBridge {
         handle: UnsafeMutableRawPointer,
         isAvailable: @convention(c) () -> Bool,
         createDefault: @convention(c) () -> UnsafeMutableRawPointer?,
+        createList: (@convention(c) () -> UnsafeMutableRawPointer?)?,
         registerContactFrame: @convention(c) (UnsafeMutableRawPointer?, UnsafeMutableRawPointer?) -> Void,
         start: @convention(c) (UnsafeMutableRawPointer?, Int32) -> Int32,
         stop: @convention(c) (UnsafeMutableRawPointer?) -> Int32,
-        release: @convention(c) (UnsafeMutableRawPointer?) -> Void,
         isRunning: @convention(c) (UnsafeMutableRawPointer?) -> Bool
     ) {
         self.handle = handle
         self.isAvailable = isAvailable
         self.createDefault = createDefault
+        self.createList = createList
         self.registerContactFrame = registerContactFrame
         self.start = start
         self.stop = stop
-        self.release = release
         self.isRunning = isRunning
     }
 }
@@ -589,16 +597,18 @@ public final class TrackpadTouchMonitor {
 
     /// MT 回调线程在主线程 drain 时读取；startDevice 前设置、stopDevice 后置空。
     nonisolated(unsafe) private static var activeMonitor: TrackpadTouchMonitor?
-    /// 识别 pipeline（识别器 + 事件邮箱 + 空闲帧过滤状态）：MT 回调线程经锁取
-    /// 快照使用（O7 生命周期保护）；stopDevice 先 MTDeviceStop 再置空。
-    nonisolated private static let pipelineRef = OSAllocatedUnfairLock<TouchPipeline?>(initialState: nil)
+    /// 识别 pipeline（识别器 + 事件邮箱 + 空闲帧过滤状态），按设备指针的
+    /// 地址值索引（O10 多设备：每设备一个识别器，触点不混流；键用 Int 是
+    /// 因为 UnsafeMutableRawPointer 不再隐式 Sendable，进不了锁的约束）。
+    /// MT 回调线程经锁取快照使用；stopDevice 先 MTDeviceStop 再置空。运行期只读。
+    nonisolated private static let pipelinesRef = OSAllocatedUnfairLock<[Int: TouchPipeline]>(initialState: [:])
     /// 捏合会话驱动的抑制窗口（MT 线程写 / tap 回调读）。
     nonisolated static let suppressor = GestureSuppressor()
 
-    /// 空闲帧过滤决策（纯函数，供测试）：转发 = 多触活动（≥2）或触点数下降
-    /// （离板/收尾帧）。单指空闲帧（光标移动、单指滚动）对识别器无意义——
-    /// 会话只由 ≥4 触点开启、存活帧必然 ≥4、离板帧触点数必然下降——跳过
-    /// 即可，省去 125Hz 的主线程 hop。
+    /// 空闲帧过滤决策（纯函数，供测试）：运行识别器 = 多触活动（≥2）或触点数
+    /// 下降（离板/收尾帧）。单指空闲帧（光标移动、单指滚动）对识别器无意义——
+    /// 会话只由 ≥4 触点开启、存活帧必然 ≥4、离板帧触点数必然下降——跳过即可，
+    /// 省去 125Hz 的识别开销。
     nonisolated static func shouldForwardMTFrame(touching: Int, lastTouching: Int) -> Bool {
         touching >= 2 || touching < lastTouching
     }
@@ -606,7 +616,11 @@ public final class TrackpadTouchMonitor {
     /// 测试驱动入口（ingestForTesting）专用识别器：与 MT pipeline 的识别器
     /// 互不相干（MT 回调永不触碰它）。
     private let recognizer = PinchTouchRecognizer()
-    private var device: UnsafeMutableRawPointer?
+    /// 当前已启动的设备引用（startDevice 填充、stopDevice 清空）。
+    private var devices: [UnsafeMutableRawPointer] = []
+    /// 本进程内已注册过回调的设备指针地址值：设备引用永不释放（见 startDevice），
+    /// 地址恒有效，据此保证重启不叠加重复回调（O10）。
+    private var registeredDevices: Set<Int> = []
     private var axChangeObserver: (any NSObjectProtocol)?
     /// 睡眠唤醒 / 会话切换观察者（O4）：MT 设备在系统睡眠、唤醒或切换用户后
     /// 经常不再回调，手势入口静默失灵只能重启 App 恢复；唤醒后延迟重启设备。
@@ -647,9 +661,11 @@ public final class TrackpadTouchMonitor {
         guard enabled != isEnabled else { return }
         isEnabled = enabled
         restart()
-        // 唤醒观察者只在关闭手势时移除（stop/restart 不移除，否则下次唤醒监听不到）
+        // 唤醒观察者与热插拔通知只在关闭手势时移除（stop/restart 不移除，
+        // 否则下次唤醒/插拔就监听不到了）
         if !enabled {
             removeWakeObservers()
+            removeHotPlugWatch()
         }
     }
 
@@ -660,6 +676,7 @@ public final class TrackpadTouchMonitor {
         startSuppressorTap()
         observePermissionChange()
         observeSystemWake()
+        observeDeviceHotPlug()
     }
 
     public func stop() {
@@ -699,6 +716,95 @@ public final class TrackpadTouchMonitor {
         wakeObservers = []
     }
 
+    // MARK: 设备热插拔（O10）
+
+    /// 热插拔通知（IOKit 首配 / 终止）：外接 Magic Trackpad 插入、拔出（或系统
+    /// 重新枚举设备）后防抖 1s 重启，重新走 MTDeviceCreateList 拿最新设备集。
+    /// 服务类名 AppleMultitouchDevice 经本机 ioreg 确认（2026-11-22）。
+    private var hotPlugWatch: (port: IONotificationPortRef, iterators: [io_iterator_t])?
+    private var hotPlugRestartWork: DispatchWorkItem?
+
+    private func observeDeviceHotPlug() {
+        guard hotPlugWatch == nil else { return }
+        // 通知端口挂主 runloop：回调即主线程，可直接做防抖重启。
+        guard let port = IONotificationPortCreate(kIOMainPortDefault) else {
+            Self.logger.warning("IONotificationPortCreate 失败，热插拔监听不可用")
+            return
+        }
+        if let source = IONotificationPortGetRunLoopSource(port)?.takeUnretainedValue() {
+            CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode)
+        }
+        var iterators: [io_iterator_t] = []
+        for interest in [kIOFirstMatchNotification, kIOTerminatedNotification] {
+            guard let matching = IOServiceMatching("AppleMultitouchDevice") else { continue }
+            var iterator: io_iterator_t = 0
+            let result = IOServiceAddMatchingNotification(
+                port, interest, matching, Self.deviceSetChangedCallback, nil, &iterator
+            )
+            guard result == KERN_SUCCESS else {
+                Self.logger.error("IOServiceAddMatchingNotification 失败 kr=\(result)")
+                continue
+            }
+            // 初始 drain 才会武装通知：现存设备（内建板）在此次 drain 中静默跳过，
+            // 之后插拔才触发回调。
+            Self.drainDeviceIterator(iterator)
+            iterators.append(iterator)
+        }
+        guard !iterators.isEmpty else {
+            IONotificationPortDestroy(port)
+            return
+        }
+        hotPlugWatch = (port, iterators)
+    }
+
+    private func removeHotPlugWatch() {
+        hotPlugRestartWork?.cancel()
+        hotPlugRestartWork = nil
+        guard let watch = hotPlugWatch else { return }
+        for iterator in watch.iterators {
+            IOObjectRelease(iterator)
+        }
+        if let source = IONotificationPortGetRunLoopSource(watch.port)?.takeUnretainedValue() {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .defaultMode)
+        }
+        IONotificationPortDestroy(watch.port)
+        hotPlugWatch = nil
+    }
+
+    /// IOKit 通知回调类型（SDK 未导出 IOServiceNotificationCallback 别名，内联声明）。
+    private typealias DeviceSetChangedCallbackC = @convention(c) (UnsafeMutableRawPointer?, io_iterator_t) -> Void
+
+    /// IOKit 通知回调（主 runloop）：drain 本次通知的 service 引用（保持通知
+    /// 武装）并防抖 1s 重启设备。
+    nonisolated private static let deviceSetChangedCallback: DeviceSetChangedCallbackC = { _, iterator in
+        MainActor.assumeIsolated {
+            drainDeviceIterator(iterator)
+            guard let monitor = TrackpadTouchMonitor.activeMonitor else { return }
+            monitor.debounceHotPlugRestart()
+        }
+    }
+
+    /// 取走并释放迭代器里的 service 引用（IOServiceAddMatchingNotification 的
+    /// 武装要求；引用不释放会漏拿后续通知）。
+    nonisolated private static func drainDeviceIterator(_ iterator: io_iterator_t) {
+        while true {
+            let service = IOIteratorNext(iterator)
+            if service == 0 { break }
+            IOObjectRelease(service)
+        }
+    }
+
+    private func debounceHotPlugRestart() {
+        hotPlugRestartWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, self.isEnabled else { return }
+            Self.logger.info("触控板设备集变化，重启识别器")
+            self.restart()
+        }
+        hotPlugRestartWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
+    }
+
     /// 是否已具备「辅助功能」权限（仅抑制系统双开需要，手势本体不需要）。
     nonisolated public static var hasPermission: Bool {
         AXIsProcessTrusted()
@@ -711,50 +817,96 @@ public final class TrackpadTouchMonitor {
 
     private func startDevice() {
         guard let bridge = MultitouchBridge.load(logger: Self.logger) else { return }
-        guard bridge.isAvailable() else {
-            Self.logger.warning("本机无内置触控板（MTDeviceIsAvailable=false），手势入口不可用")
-            return
+        // 多设备（O10）：MTDeviceCreateList 枚举全部触控板（内建 + 外接 Magic
+        // Trackpad / 合盖外显只用外接板的场景），每设备独立 pipeline；符号缺失
+        // 时退化为仅默认设备（原行为，不影响启用）。
+        // 所有权约定：设备引用一律不 MTDeviceRelease（社区对 CreateList 的引用
+        // 语义无共识，过度释放会野指针；少量常驻泄漏换来指针恒有效——这是
+        // registeredDevices 去重可靠的前提），CFRelease 数组同理不执行。
+        var devices: [UnsafeMutableRawPointer] = []
+        if let createList = bridge.createList {
+            if let array = createList() {
+                let cfArray = Unmanaged<CFArray>.fromOpaque(array).takeUnretainedValue()
+                for i in 0..<CFArrayGetCount(cfArray) {
+                    if let device = unsafeBitCast(CFArrayGetValueAtIndex(cfArray, i), to: UnsafeMutableRawPointer?.self) {
+                        devices.append(device)
+                    }
+                }
+            }
+            if devices.isEmpty {
+                Self.logger.info("MTDeviceCreateList 为空：本机无触控板，手势入口不可用")
+                return
+            }
+        } else {
+            guard bridge.isAvailable() else {
+                Self.logger.warning("本机无内置触控板（MTDeviceIsAvailable=false），手势入口不可用")
+                return
+            }
+            guard let device = bridge.createDefault() else {
+                Self.logger.warning("MTDeviceCreateDefault 失败，手势入口不可用")
+                return
+            }
+            devices = [device]
         }
-        guard let device = bridge.createDefault() else {
-            Self.logger.warning("MTDeviceCreateDefault 失败，手势入口不可用")
-            return
-        }
+
         Self.activeMonitor = self
         // 每次 startDevice 新建 pipeline：识别器/邮箱/空闲帧过滤状态天然重置。
-        Self.pipelineRef.withLock { $0 = TouchPipeline() }
-        bridge.registerContactFrame(device, unsafeBitCast(Self.contactFrameCallback, to: UnsafeMutableRawPointer.self))
-        let status = bridge.start(device, 0)
-        if status != 0 {
-            Self.logger.error("MTDeviceStart 失败 status=\(status)")
+        var pipelines: [Int: TouchPipeline] = [:]
+        for device in devices {
+            pipelines[Int(bitPattern: device)] = TouchPipeline()
+        }
+        // 先发布字典再启动设备：启动瞬间的早期帧也能被正确路由。
+        Self.publishPipelines(pipelines)
+        for device in devices {
+            // 注册按设备指针地址去重：设备引用恒有效，重启不会叠加重复回调。
+            let deviceKey = Int(bitPattern: device)
+            if !registeredDevices.contains(deviceKey) {
+                bridge.registerContactFrame(device, unsafeBitCast(Self.contactFrameCallback, to: UnsafeMutableRawPointer.self))
+                registeredDevices.insert(deviceKey)
+            }
+            let status = bridge.start(device, 0)
+            if status != 0 {
+                Self.logger.error("MTDeviceStart 失败 status=\(status)")
+                pipelines.removeValue(forKey: deviceKey)
+                Self.publishPipelines(pipelines)
+            }
+        }
+        guard !pipelines.isEmpty else {
             Self.activeMonitor = nil
-            Self.pipelineRef.withLock { $0 = nil }
+            Self.pipelinesRef.withLock { $0 = [:] }
             return
         }
-        self.device = device
-        Self.logger.info("原始触点识别器已启动（MTDeviceCreateDefault + contact frame 回调）")
-        Self.trace("DEVICE-STARTED")
+        self.devices = devices
+        Self.logger.info("原始触点识别器已启动（\(devices.count) 台触控板，CreateList/CreateDefault）")
+        Self.trace("DEVICE-STARTED n=\(devices.count)")
+    }
+
+    /// 发布 pipeline 字典（@Sendable 锁闭包不能捕获可变局部变量，经 let 参数中转）。
+    nonisolated private static func publishPipelines(_ pipelines: [Int: TouchPipeline]) {
+        pipelinesRef.withLock { $0 = pipelines }
     }
 
     private func stopDevice() {
-        guard let bridge = MultitouchBridge.load(logger: Self.logger), let device else { return }
-        // 先停设备（MTDeviceStop 返回后不再有新回调），再清引用；在途回调持有
-        // pipeline 快照强引用，不受置空影响（O7 生命周期保护）。
-        if bridge.isRunning(device) {
-            _ = bridge.stop(device)
-        }
-        // 半途会话补发 cancelled（O4）：避免窗口层卡在跟手状态
-        // （pinchStartVisible 不为 nil）。MTDeviceStop 已停回调，主线程此刻
-        // 独占 pipeline，abort 与 MT 回调不会并发。
-        let pipeline = Self.pipelineRef.withLock { $0 }
-        if let pipeline {
-            for event in pipeline.recognizer.abort() {
-                onEvent?(event)
+        guard let bridge = MultitouchBridge.load(logger: Self.logger), !devices.isEmpty else { return }
+        let pipelines = Self.pipelinesRef.withLock { $0 }
+        for device in devices {
+            // 先停设备（MTDeviceStop 返回后不再有新回调）；在途回调持有
+            // pipeline 快照强引用，不受置空影响（O7 生命周期保护）。
+            if bridge.isRunning(device) {
+                _ = bridge.stop(device)
+            }
+            // 半途会话补发 cancelled（O4）：避免窗口层卡在跟手状态。此时主线程
+            // 独占 pipeline，abort 与 MT 回调不会并发。
+            if let pipeline = pipelines[Int(bitPattern: device)] {
+                for event in pipeline.recognizer.abort() {
+                    onEvent?(event)
+                }
             }
         }
-        bridge.release(device)
-        self.device = nil
+        // registeredDevices 保留：设备引用不释放（指针恒有效），重启后复用注册。
+        self.devices = []
         Self.activeMonitor = nil
-        Self.pipelineRef.withLock { $0 = nil }
+        Self.pipelinesRef.withLock { $0 = [:] }
         Self.trace("DEVICE-STOPPED")
     }
 
@@ -763,8 +915,8 @@ public final class TrackpadTouchMonitor {
     /// MT 接触帧回调（MT 内部线程；无上下文参数，经 static 转交）。
     /// MTTouch 是 Swift 声明的布局结构，无法出现在 @convention(c) 签名里，
     /// 因此以 UnsafeRawPointer 按偏移解读（布局经本机探针验证）。
-    private static let contactFrameCallback: @convention(c) (UnsafeMutableRawPointer?, UnsafeRawPointer?, Int32, Double, Int32) -> Void = { _, touches, count, _, _ in
-        guard let touches, count > 0 else { return }
+    private static let contactFrameCallback: @convention(c) (UnsafeMutableRawPointer?, UnsafeRawPointer?, Int32, Double, Int32) -> Void = { device, touches, count, _, _ in
+        guard let device, let touches, count > 0 else { return }
         // 第一遍只数接触数：单指空闲帧在此短路（不构建样本、不跑识别器）
         var touching = 0
         for i in 0..<Int(count) {
@@ -772,9 +924,11 @@ public final class TrackpadTouchMonitor {
             if state == 3 || state == 4 { touching += 1 }
         }
         suppressor.note(touchingCount: touching)
-        // 锁内取一次快照后使用：stopDevice 先 MTDeviceStop 再置空引用，且
-        // pipeline 是 class——快照持有的强引用保证回调期间不会被释放。
-        guard let pipeline = pipelineRef.withLock({ $0 }) else { return }
+        // 按设备指针取 pipeline（O10 多设备路由）；锁内取一次快照后使用：
+        // stopDevice 先 MTDeviceStop 再置空引用，且 pipeline 是 class——快照
+        // 持有的强引用保证回调期间不会被释放。
+        let deviceKey = Int(bitPattern: device)  // 键在锁外换算（指针不进 @Sendable 闭包）
+        guard let pipeline = pipelinesRef.withLock({ $0[deviceKey] }) else { return }
         let forward = shouldForwardMTFrame(touching: touching, lastTouching: pipeline.lastForwardedTouching)
         pipeline.lastForwardedTouching = touching
         guard forward || traceEnabled else { return }

@@ -808,4 +808,43 @@ struct PinchTouchRecognizerTests {
         // drain 后再 post 重新返回 true（调度窗口已重置）
         #expect(mailbox.post([PinchGestureEvent(phase: .changed, signedProgress: 0.6)]))
     }
+
+    // MARK: 多设备（O10：每设备独立 pipeline）
+
+    /// 两组触点 id 相同但来源设备不同的帧交替注入：各自识别、互不串扰
+    /// （内建板 + 外接板同时出手势，识别器状态不得互相污染）。
+    /// 抑制器全局共享（任一设备的会话都可武装），不在此断言。
+    @Test func perDevicePipelinesDoNotInterfere() {
+        let padIn = TouchPipeline()   // 板 A：捏拢（正进度）
+        let padOut = TouchPipeline()  // 板 B：张开（负进度），触点 id 相同
+
+        var now: TimeInterval = 1000
+        let step: TimeInterval = 0.008
+        var eventsIn: [PinchGestureEvent] = []
+        var eventsOut: [PinchGestureEvent] = []
+
+        // 交替喂 20 帧：A 捏拢 k 3.0→2.0，B 张开 k 1.0→2.0
+        for i in 0...20 {
+            let kA = Float(3.0) - Float(i) * 0.05
+            let kB = Float(1.0) + Float(i) * 0.05
+            let state: Int32 = i == 0 ? 3 : 4
+            eventsIn.append(contentsOf: padIn.recognizer.ingest(
+                crossFrame(ids: [1, 2, 3, 4], k: kA, state: state), now: now).events)
+            eventsOut.append(contentsOf: padOut.recognizer.ingest(
+                crossFrame(ids: [1, 2, 3, 4], k: kB, state: state), now: now).events)
+            now += step
+        }
+
+        // 各自识别出方向相反的手势：A 捏拢（正），B 张开（负）
+        #expect(eventsIn.contains { $0.phase == .began })
+        #expect(eventsOut.contains { $0.phase == .began })
+        #expect(eventsIn.contains { $0.phase == .changed && $0.signedProgress > 0.1 },
+                "板 A 应识别出捏拢（正进度）")
+        #expect(eventsOut.contains { $0.phase == .changed && $0.signedProgress < -0.1 },
+                "板 B 应识别出张开（负进度）")
+        #expect(eventsIn.allSatisfy { $0.signedProgress >= 0 },
+                "板 A 的事件不得混入板 B 的负进度（识别器状态互不污染）")
+        #expect(eventsOut.allSatisfy { $0.signedProgress <= 0 },
+                "板 B 的事件不得混入板 A 的正进度")
+    }
 }
