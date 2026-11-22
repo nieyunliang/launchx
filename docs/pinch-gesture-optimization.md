@@ -1,6 +1,6 @@
 # 四指捏合手势系统优化方案
 
-> 状态：方案稿（未实施）　｜　日期：2026-11-22　｜　范围：`Sources/LaunchXCore/Invoke/TrackpadTouchMonitor.swift`、`Sources/LaunchXCore/Launchpad/LaunchpadWindowController.swift`、`Sources/LaunchXCore/Launchpad/LaunchpadContentView.swift`、`Sources/LaunchXCore/App/AppDelegate.swift` 及对应测试
+> 状态：第 1 批（P0）、第 2 批（P2）、第 4 批（P3）已实施（2026-11-22）；第 3 批（P1）待第 7 节真机标定后实施　｜　日期：2026-11-22　｜　范围：`Sources/LaunchXCore/Invoke/TrackpadTouchMonitor.swift`、`Sources/LaunchXCore/Launchpad/LaunchpadWindowController.swift`、`Sources/LaunchXCore/Launchpad/LaunchpadContentView.swift`、`Sources/LaunchXCore/App/AppDelegate.swift` 及对应测试
 
 ---
 
