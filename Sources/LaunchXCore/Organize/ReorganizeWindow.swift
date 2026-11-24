@@ -160,6 +160,9 @@ public final class ReorganizeWindowController: NSObject, NSWindowDelegate {
             self.window = window
         }
         window?.level = LaunchpadWindowController.childWindowLevel
+        if let window {
+            LaunchpadWindowController.registerChildWindow(window)
+        }
         NSApp.activate(ignoringOtherApps: true)
         WindowFade.fadeIn(window!)
     }

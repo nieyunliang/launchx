@@ -133,13 +133,59 @@ struct PageSettleTakeoverTests {
         #expect(model.isSettlingPageDrag)
 
         let presentation = model.takeOverPageSettle()
-        // 刚起滑：表现值仍贴着起点（曲线零点斜率有限，容差内）
+        // 刚起滑：表现值仍贴着起点（曲线零点斜率有限，容差内）。
+        // 挂起的提交翻页在接管时兑现：页码推进 1、偏移按页宽重定基（-600 → +400），
+        // 条带总偏移 −page×width + offset 不变，画面无跳变
         #expect(presentation != nil)
-        #expect(abs(presentation! + 600) < 20)
+        #expect(abs(presentation! - 400) < 20)
         #expect(!model.isSettlingPageDrag)
         #expect(model.pageSettleAnimation == nil)
-        #expect(abs(model.pageDragOffset + 600) < 20)  // 偏移无动画钉在表现值上
-        #expect(model.currentPage == 0)  // 接管即取消挂起换页
+        #expect(model.pendingCommitDirection == nil)
+        #expect(abs(model.pageDragOffset - 400) < 20)
+        #expect(model.currentPage == 1)
+    }
+
+    /// 回归：连续横滑——落位中再次横滑必须能直接翻到下一页，不必等页码点变化。
+    @Test func consecutiveSwipesAdvanceTwoPages() {
+        let (model, dir) = makeModel()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        store3Pages(model)
+
+        model.pageDragOffset = -600
+        model.settlePageDrag(commitDirection: 1)
+        let resume = model.takeOverPageSettle()!
+        #expect(model.currentPage == 1)
+
+        // 新手势从重定基后的偏移续滑并越过阈值 → 再翻一页
+        var g = InteractivePageGesture()
+        _ = g.feed(delta: -800, isGestureStart: true, isEnded: false, isMomentum: false,
+                   isDiscrete: false, canGoBackward: true, canGoForward: model.currentPage < model.pageCount - 1,
+                   pageWidth: width, at: at(0), resumingFrom: resume)
+        let action = g.feed(delta: 0, isGestureStart: false, isEnded: true, isMomentum: false,
+                            isDiscrete: false, canGoBackward: true, canGoForward: true,
+                            pageWidth: width, at: at(0.3))
+        #expect(action == .settle(1))
+        model.pageDragOffset = g.displayOffset
+        model.settlePageDrag(commitDirection: 1)
+        _ = model.takeOverPageSettle()
+        #expect(model.currentPage == 2)
+    }
+
+    @Test func takeOverBounceKeepsPage() {
+        let (model, dir) = makeModel()
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        model.pageDragOffset = -100
+        model.settlePageDrag(commitDirection: 0)
+        let presentation = model.takeOverPageSettle()
+        #expect(model.currentPage == 0)  // 回弹不换页
+        #expect(abs(presentation! + 100) < 20)
+    }
+
+    private func store3Pages(_ model: LaunchpadModel) {
+        model.store.updateLayout { layout in
+            layout.pages.append(PageRecord())
+        }
     }
 
     @Test func settleNearTargetFinishesImmediately() {

@@ -247,30 +247,19 @@ struct FolderMemberCell: View {
         Button(app.hidden ? "取消隐藏" : "隐藏") { model.toggleHidden(appID: app.id) }
         Button("从文件夹移出") { model.moveOutOfFolder(appID: app.id) }
         Divider()
-        // 替身没有关联文件（删替身即可）；系统应用不可卸载，保留「移到废纸篓」由模型层拦截并 toast。
-        if app.isAlias || app.path.hasPrefix("/System") {
+        // 替身没有关联文件（删替身即可）。系统应用直接置灰不给入口（P1-8 / P2-11）：
+        // 旧文案「移除需要管理员权限，已取消操作」把 SIP 保护说成了权限问题。
+        if app.isAlias {
             Button("移到废纸篓…") {
-                Task { await confirmAndTrash() }
+                Task { await model.confirmAndTrash(appID: app.id) }
             }
+        } else if let reason = model.uninstallBlockReason(appID: app.id) {
+            Button("无法卸载：\(reason)") {}
+                .disabled(true)
         } else {
             Button("卸载「\(app.name)」…") {
                 model.onOpenUninstall?(app.id)
             }
-        }
-    }
-
-    private func confirmAndTrash() async {
-        let outcome = await model.moveToTrash(appID: app.id)
-        switch outcome {
-        case let .needsAdmin(name):
-            ToastManager.shared.show(
-                .error,
-                "「\(name)」是系统应用，移除需要管理员权限，已取消操作。"
-            )
-        case let .trashed(name):
-            ToastManager.shared.success("已将「\(name)」移到废纸篓")
-        case let .failed(message):
-            ToastManager.shared.error("移到废纸篓失败：\(message)")
         }
     }
 }

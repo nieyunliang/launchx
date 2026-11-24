@@ -307,18 +307,31 @@ public final class LaunchpadModel {
     /// 落位动画期间新手势接管：取消挂起收尾，把偏移无动画地钉在当前曲线表现值上，
     /// 返回该值作为接管手势的起始偏移（调用方以此为起点继续 1:1 跟手）。
     /// 表现值与在屏画面逐帧一致，接管瞬间无跳变；无落位动画时返回 nil。
+    ///
+    /// 挂起的是「提交翻页」（±1）时，接管即兑现这次翻页：页码原子推进、偏移按
+    /// 页宽重定基（`presentation + direction × width`），条带总偏移不变、画面无跳变。
+    /// 否则接管手势仍以旧页为基准，只能把上一次翻页「滑完」，要连翻必须等落位
+    /// 收尾（页码点变化）后才能开始下一页。
     public func takeOverPageSettle() -> CGFloat? {
         guard isSettlingPageDrag, let animation = pageSettleAnimation else { return nil }
+        let direction = pendingCommitDirection ?? 0
         pageSettleWork?.cancel()
         pageSettleWork = nil
         pageSettleAnimation = nil
-        pendingCommitDirection = nil
-        let presentation = animation.presentationOffset(at: Date())
+        var offset = animation.presentationOffset(at: Date())
         var transaction = Transaction()
         transaction.disablesAnimations = true
-        withTransaction(transaction) { pageDragOffset = presentation }
+        withTransaction(transaction) {
+            let target = min(max(currentPage + direction, 0), pageCount - 1)
+            if direction != 0, target != currentPage {
+                offset += CGFloat(target - currentPage) * max(pageWidth, 1)
+                currentPage = target
+            }
+            pageDragOffset = offset
+            pendingCommitDirection = nil
+        }
         isSettlingPageDrag = false
-        return presentation
+        return offset
     }
 
     // MARK: - 搜索
@@ -576,15 +589,26 @@ public final class LaunchpadModel {
 
     public enum TrashOutcome {
         case trashed(name: String)
-        case needsAdmin(name: String)
+        /// 系统保护 / 只读卷等前置拦截：不做任何删除，并给出原因。
+        case blocked(reason: String)
         case failed(String)
+    }
+
+    /// 卸载入口前置判定：返回不能卸载的原因（nil = 可以卸载）。
+    ///
+    /// 系统应用（/System 路径，或指向只读系统卷的符号链接，如 /Applications/Safari.app）
+    /// 不再给「卸载」入口：旧路径会先清缓存、再因为 SIP 删不掉本体，
+    /// 用户数据没了应用还在（评审 P1-8 / P2-11）。
+    public func uninstallBlockReason(appID: String) -> String? {
+        guard let app = layout.apps[appID] else { return "未找到应用" }
+        return UninstallEligibility.blockReason(for: app)
     }
 
     /// 移到废纸篓（系统应用拦截；alias 只删替身）。UI 弹窗由调用方承担。
     public func moveToTrash(appID: String) async -> TrashOutcome {
         guard let app = layout.apps[appID] else { return .failed("未找到应用") }
-        if app.path.hasPrefix("/System") {
-            return .needsAdmin(name: app.name)
+        if let reason = UninstallEligibility.blockReason(for: app) {
+            return .blocked(reason: reason)
         }
         do {
             _ = try await FinderActions.moveToTrash(app)
@@ -601,6 +625,31 @@ public final class LaunchpadModel {
         } catch {
             return .failed(error.localizedDescription)
         }
+    }
+
+    /// 右键「移到废纸篓」的统一反馈入口（AppCell / FolderViews 不再各写一份 toast）。
+    public func confirmAndTrash(appID: String) async {
+        let fallbackName = layout.apps[appID]?.name ?? "该应用"
+        switch await moveToTrash(appID: appID) {
+        case let .trashed(name):
+            ToastManager.shared.success("已将「\(name)」移到废纸篓")
+        case let .blocked(reason):
+            ToastManager.shared.error("无法移除「\(fallbackName)」：\(reason)")
+        case let .failed(message):
+            ToastManager.shared.error("移到废纸篓失败：\(message)")
+        }
+    }
+
+    /// 卸载器删除应用后回调：布局移除 + 选择集 / 打开态文件夹收尾（评审 P2-9）。
+    ///
+    /// 卸载器若只 `layoutStore.updateLayout`，被移出的 id 会留在选择集里（工具栏计数虚高、
+    /// 可生成单人文件夹），打开态文件夹也可能指向已空的文件夹。
+    public func appDidGetUninstalled(appID: String) {
+        store.updateLayout { layout in
+            layout.removeApp(id: appID)
+        }
+        selectedAppIDs.remove(appID)
+        reconcileOpenedFolder()
     }
 
     // MARK: - 右键动作透传

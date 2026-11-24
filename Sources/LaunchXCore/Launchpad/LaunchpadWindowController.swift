@@ -618,6 +618,22 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
         isOverlayOnScreen ? overlayChildWindowLevel : .normal
     }
 
+    /// 已打开的子窗口（设置 / 整理布局 / 卸载）。弱引用，不参与窗口生命周期。
+    private static var childWindows = NSHashTable<NSWindow>.weakObjects()
+
+    /// 子窗口创建时登记，面板显隐切换时统一跟随调整层级（评审 P3-4）。
+    public static func registerChildWindow(_ window: NSWindow) {
+        childWindows.add(window)
+    }
+
+    /// 把当前应有的层级应用到所有仍可见的子窗口。
+    private static func updateChildWindowLevels() {
+        let level = childWindowLevel
+        for window in childWindows.allObjects where window.isVisible {
+            window.level = level
+        }
+    }
+
     public let model: LaunchpadModel
 
     private var panel: AlwaysKeyPanel?
@@ -731,6 +747,7 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
         panel?.orderFrontRegardless()
         panel?.makeKey()
         Self.isOverlayOnScreen = true
+        Self.updateChildWindowLevels()
         installAutoHideMonitors()
     }
 
@@ -742,6 +759,7 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
             self.panel?.orderOut(nil)
             self.isHiding = false
             LaunchpadWindowController.isOverlayOnScreen = false
+            LaunchpadWindowController.updateChildWindowLevels()
             try? self.model.store.saveNow()
         }
         hideWorkItem = work

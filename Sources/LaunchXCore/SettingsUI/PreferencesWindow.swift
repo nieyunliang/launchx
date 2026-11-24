@@ -333,6 +333,7 @@ public final class PreferencesWindowController: NSObject, NSWindowDelegate {
         guard let window else { return }
         // 面板是全屏 statusBar 层级：面板可见时子窗口必须抬到它之上，否则会被完全遮住。
         window.level = LaunchpadWindowController.childWindowLevel
+        LaunchpadWindowController.registerChildWindow(window)
         NSApp.activate(ignoringOtherApps: true)
         WindowFade.fadeIn(window)
     }

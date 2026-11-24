@@ -289,12 +289,16 @@ struct AppCell: View {
                 model.forceQuit(appID: app.id)
             }
         }
-        // 替身没有关联文件（删替身即可）；系统应用不可卸载，
-        // 保留原「移到废纸篓」路径由模型层拦截并 toast。
-        if app.isAlias || app.path.hasPrefix("/System") {
+        // 替身没有关联文件（删替身即可）。系统应用直接置灰不给入口：
+        // 旧文案「移除需要管理员权限，已取消操作」既误导（实际是 SIP 不可移除）
+        // 又像是用户自己取消的（评审 P1-8 / P2-11）。
+        if app.isAlias {
             Button("移到废纸篓…") {
-                Task { await confirmAndTrash() }
+                Task { await model.confirmAndTrash(appID: app.id) }
             }
+        } else if let reason = model.uninstallBlockReason(appID: app.id) {
+            Button("无法卸载：\(reason)") {}
+                .disabled(true)
         } else {
             Button("卸载「\(app.name)」…") {
                 model.onOpenUninstall?(app.id)
@@ -304,21 +308,6 @@ struct AppCell: View {
             Divider()
             Button("合并到新文件夹") { model.mergeSelectionIntoNewFolder() }
             Button("隐藏所选 (\(model.selectedAppIDs.count))") { model.hideSelection() }
-        }
-    }
-
-    private func confirmAndTrash() async {
-        let outcome = await model.moveToTrash(appID: app.id)
-        switch outcome {
-        case let .needsAdmin(name):
-            ToastManager.shared.show(
-                .error,
-                "「\(name)」是系统应用，移除需要管理员权限，已取消操作。"
-            )
-        case let .trashed(name):
-            ToastManager.shared.success("已将「\(name)」移到废纸篓")
-        case let .failed(message):
-            ToastManager.shared.error("移到废纸篓失败：\(message)")
         }
     }
 }

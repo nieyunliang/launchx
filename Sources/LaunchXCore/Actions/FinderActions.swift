@@ -12,6 +12,9 @@ public enum FinderActionError: LocalizedError {
     case dockImportFailed(String)
     /// 应用路径不存在
     case pathMissing(String)
+    /// 系统未真正接收回收请求（recycle 返回字典里没有该 URL）。见 P0-2：
+    /// 「没抛错」不等于「已移入废纸篓」，拿空字典当成功会虚报卸载。
+    case trashRejected(String)
 
     public var errorDescription: String? {
         switch self {
@@ -23,7 +26,15 @@ public enum FinderActionError: LocalizedError {
             return "写回 Dock 配置失败：\(message)"
         case .pathMissing(let path):
             return "未找到应用：\(path)"
+        case .trashRejected(let path):
+            return "未能移到废纸篓（系统未接收，可能没有权限或文件正被占用）：\(path)"
         }
+    }
+
+    /// 是否属于「路径已不存在」。卸载器把「应用本就不在」视同已卸载。
+    public var isPathMissing: Bool {
+        if case .pathMissing = self { return true }
+        return false
     }
 }
 
@@ -191,17 +202,41 @@ public enum FinderActions {
         }
     }
 
-    /// 移到废纸篓（确认弹窗由调用方 UI 负责）。返回实际移除的 URL。
-    @discardableResult
-    public static func moveToTrash(_ entry: AppRecord) async throws -> [URL] {
+    /// 校验 recycle 的返回字典：只有「请求的 URL 全部出现在返回字典中」才算真正回收。
+    ///
+    /// NSWorkspace.recycle 用「省略字典项」表达「这个 URL 没被接收」，并不保证抛错；
+    /// 旧实现直接取值再 `?? []`，于是「返回空但无异常」会被上层当成成功（P0-2）。
+    /// 抽成纯函数便于单测覆盖 nil / 空字典 / 部分接收三种输入。
+    static func verifiedTrashResult(_ moved: [URL: URL]?, requested: [URL]) throws -> [URL: URL] {
+        let resolved = moved ?? [:]
+        let missing = requested.filter { resolved[$0] == nil }
+        guard missing.isEmpty else {
+            throw FinderActionError.trashRejected(missing.map(\.path).joined(separator: "、"))
+        }
+        return resolved
+    }
+
+    /// 把应用本体移到废纸篓，返回废纸篓内的新位置。
+    /// 只有系统真正接收才算成功；未被接收一律抛错（调用方按失败处理）。
+    public static func recycleApp(_ entry: AppRecord) async throws -> URL {
         guard FileManager.default.fileExists(atPath: entry.path) else {
             throw FinderActionError.pathMissing(entry.path)
         }
-        // SDK 各版本返回可选性不同，显式标注后取字典 values
-        let trashed: [URL: URL]? = try await NSWorkspace.shared.recycle(
-            [URL(fileURLWithPath: entry.path)]
-        )
-        return trashed.map { Array($0.values) } ?? []
+        let url = URL(fileURLWithPath: entry.path)
+        // SDK 各版本返回可选性不同，显式标注后交给校验函数
+        let trashed: [URL: URL]? = try await NSWorkspace.shared.recycle([url])
+        let verified = try verifiedTrashResult(trashed, requested: [url])
+        guard let destination = verified[url] else {
+            // verifiedTrashResult 已保证存在；保留兜底避免强制解包
+            throw FinderActionError.trashRejected(url.path)
+        }
+        return destination
+    }
+
+    /// 移到废纸篓（确认弹窗由调用方 UI 负责）。返回实际移除的 URL。
+    @discardableResult
+    public static func moveToTrash(_ entry: AppRecord) async throws -> [URL] {
+        [try await recycleApp(entry)]
     }
 
     // MARK: - 内部

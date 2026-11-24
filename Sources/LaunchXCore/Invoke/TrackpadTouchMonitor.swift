@@ -84,8 +84,15 @@ enum PinchTouchThresholds {
     /// 位移否决起步值：每指位移低于此值不参与否决（落指抖动噪声）。
     static let movementFloor: Float = 0.06
     /// 张开度变化 / 每指最大位移 低于此比值判定为平移（滑动），否决会话。
-    /// 实测（2026-11-21 真机带标签数据）：滑动 0.10~0.21，捏合 0.59~1.52，取中点。
-    static let vetoRatio: Float = 0.40
+    /// 实测（2026-11-21 真机带标签数据）：滑动 0.10~0.21，捏合 0.59~1.52。
+    /// 2026-11-24 由 0.40 下调：那批捏合样本是「四指对称收拢」，漏掉了系统
+    /// 推荐的「拇指 + 三指」手法里最常见的**拇指主导**捏合（三指基本不动、
+    /// 拇指向上收）——平均两两间距里三条指-指间距不变，把拇指的位移稀释一半：
+    /// 几何推算 ratio 仅 0.43~0.49，且在过识别门前（拇指要走约 0.10 才攒够
+    /// emitFloor）全程暴露在否决下，拇指走弧线 / 手腕轻转的一点横向分量就跌破
+    /// 0.40 → 会话被静默否决，用户感知为「偶尔捏了没反应」。取滑动上沿 0.21
+    /// 与拇指主导捏合下沿 0.43 的中点。
+    static let vetoRatio: Float = 0.32
     /// 张开度累计达到才开始投递进度（识别点，跟手从这里起步）。
     static let emitFloor: Float = 0.05
     /// 完整捏合行程对应的张开度变化（实测真捏合 0.22~0.38，取保守档）。
@@ -230,6 +237,11 @@ final class PinchTouchRecognizer: @unchecked Sendable {
             belowSince = nil
             baselineSpread = Self.spread(of: touching) ?? 0
             lastProgress = 0
+            if TrackpadTouchMonitor.traceEnabled {
+                TrackpadTouchMonitor.trace(
+                    "SESSION-OPEN members=\(activeKey.map(String.init).joined(separator: ",")) baseline=\(String(format: "%.3f", baselineSpread))"
+                )
+            }
         }
 
         // 4. 会话收尾：按成员口径判定——成员中仍在触的数跌破候选下限才是松手
@@ -242,9 +254,9 @@ final class PinchTouchRecognizer: @unchecked Sendable {
                 // （advanceSession 的成员守卫已保证），抑制窗口随 sessionActive 续期。
                 let explicitLift = samples.contains { members.contains($0.id) && $0.state >= 5 }
                 if explicitLift {
-                    endSession(now: now, into: &outcome)
+                    endSession(now: now, reason: "lift", into: &outcome)
                 } else if let since = belowSince, now - since >= PinchTouchThresholds.dropoutGrace {
-                    endSession(now: now, into: &outcome)
+                    endSession(now: now, reason: "dropout", into: &outcome)
                 } else if belowSince == nil {
                     belowSince = now
                 }
@@ -294,6 +306,13 @@ final class PinchTouchRecognizer: @unchecked Sendable {
         let ratio = evidence / max(maxFingerMove, 0.0001)
         if maxFingerMove > PinchTouchThresholds.movementFloor, ratio < PinchTouchThresholds.vetoRatio {
             outcome.vetoed = true
+            // 诊断「捏了没反应」的首要线索：否决当帧的位移 / 张开度 / 比值。
+            if TrackpadTouchMonitor.traceEnabled {
+                TrackpadTouchMonitor.trace(String(
+                    format: "SESSION-VETO emitting=%d move=%.3f delta=%.3f peak=%.3f ratio=%.2f",
+                    sessionEmitting ? 1 : 0, Double(maxFingerMove), Double(spreadDelta), Double(peakAbsDelta), Double(ratio)
+                ))
+            }
             if sessionEmitting {
                 outcome.events.append(PinchGestureEvent(phase: .cancelled, signedProgress: lastProgress))
             }
@@ -337,9 +356,16 @@ final class PinchTouchRecognizer: @unchecked Sendable {
     }
 
     /// 会话正常收尾（松手 / 失触超宽限）：投递中则补 ended，终值按松手去尾。
-    private func endSession(now: TimeInterval, into outcome: inout IngestOutcome) {
+    private func endSession(now: TimeInterval, reason: String, into outcome: inout IngestOutcome) {
         if sessionEmitting {
-            outcome.events.append(PinchGestureEvent(phase: .ended, signedProgress: trimmedEndProgress(now: now)))
+            let final = trimmedEndProgress(now: now)
+            outcome.events.append(PinchGestureEvent(phase: .ended, signedProgress: final))
+            if TrackpadTouchMonitor.traceEnabled {
+                TrackpadTouchMonitor.trace("SESSION-END reason=\(reason) final=\(String(format: "%.2f", Double(final))) peak=\(String(format: "%.3f", peakAbsDelta))")
+            }
+        } else if TrackpadTouchMonitor.traceEnabled {
+            // 未过识别门就松手：张开度没攒够 emitFloor（捏得太轻 / 起步太慢）。
+            TrackpadTouchMonitor.trace("SESSION-END reason=\(reason) silent peak=\(String(format: "%.3f", peakAbsDelta))")
         }
         closeSession(now: now)
     }
@@ -1143,13 +1169,29 @@ public final class TrackpadTouchMonitor {
 
     private func stopSuppressorTap() {
         guard let runLoop = Self.suppressorRunLoopRef else { return }
+        // 在主线程就地取走「本次要拆的」tap（tap 线程先写 tapRef 再写 runLoopRef，
+        // 拿得到 runLoop 就一定拿得到对应的 tap）。
+        let tap = Self.suppressorTapRef
+        Self.suppressorTapRef = nil
         Self.suppressorRunLoopRef = nil
         Self.suppressorThreadRef = nil
-        // 清理在 tap 线程自身执行（失效 tap → 停 runloop → 线程退出）
+        Self.scheduleTapTeardown(tap: tap, on: runLoop)
+    }
+
+    /// 清理在 tap 线程自身执行（失效 tap → 停 runloop → 线程退出）。
+    /// 必须 nonisolated：若闭包在 @MainActor 方法内直接构造，会继承主线程隔离，
+    /// Swift 6 运行时在 tap 线程执行时做执行器校验并触发 EXC_BREAKPOINT 崩溃。
+    ///
+    /// 回归：旧实现在 teardown 块里读共享的 `suppressorTapRef`。stop 后紧跟 start
+    /// （辅助功能通知连发、唤醒、热插拔都走这条路）时，新线程可能抢先把新 tap
+    /// 写进 ref，旧线程的 teardown 随后**失效了新 tap**、旧 tap 却留在已停的
+    /// runloop 上——双开抑制整段失效（系统启动台手势与本手势同时响应），旧 tap
+    /// 无人服务还会拖慢输入直到被系统超时停用。现在拆除对象在 stop 时就固定。
+    nonisolated private static func scheduleTapTeardown(tap: CFMachPort?, on runLoop: CFRunLoop) {
         CFRunLoopPerformBlock(runLoop, CFRunLoopMode.defaultMode.rawValue) {
-            if let tap = Self.suppressorTapRef {
+            if let tap {
+                CGEvent.tapEnable(tap: tap, enable: false)
                 CFMachPortInvalidate(tap)
-                Self.suppressorTapRef = nil
             }
             CFRunLoopStop(runLoop)
         }

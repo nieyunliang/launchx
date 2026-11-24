@@ -361,9 +361,9 @@ public struct LaunchpadContentView: View {
 /// 窗口化页面带 + 橡皮筋选框 + 背景放置目标。
 ///
 /// LaunchOS 同款翻页：键盘/页码点/横滑落位都共享同一套条带 offset 语义——
-/// 只物化当前页 ±1 共 3 页，每页独立设置 offset
-/// `(pageIndex − settled) × pageWidth + pageDragOffset`，与整条常驻条带的
-/// 单一 offset 在视觉上逐帧等价（横滑天然露出相邻页），但跟手每帧只重算
+/// 只物化当前页 ±1 共 3 页，页在条带内按页码固定摆放，整条条带共用单一
+/// offset（见 `PageStripLayout`），渲染原点 `(pageIndex − settled) × pageWidth
+/// + pageDragOffset`（横滑天然露出相邻页），但跟手每帧只重算
 /// 3 页（约 105 cell），成本不再随总页数增长；落位动画期间把提交目标页也
 /// 提前建好（`pendingCommitDirection`），原子换页帧不再物化新页。
 /// 跨多页跳转（页码点长跳）为直接切换，±1 翻页动画不变。
@@ -389,15 +389,27 @@ struct PagedGridArea: View {
             let windowStart = max(min(settledIndex, commitTarget) - 1, 0)
             let windowEnd = min(max(settledIndex, commitTarget) + 2, model.pageCount)
             ZStack(alignment: .topLeading) {
-                ForEach(windowStart..<max(windowEnd, windowStart + 1), id: \.self) { pageIndex in
-                    PageGridView(
-                        pageIndex: pageIndex,
-                        focusedSlot: pageIndex == model.currentPage ? gridFocus.focusedIndex : nil
-                    )
-                    .frame(width: width, height: proxy.size.height)
-                    // 每页独立 offset：与整条条带的单一 offset 逐帧等价
-                    .offset(x: CGFloat(pageIndex - settledIndex) * width + model.pageDragOffset)
+                // 页在条带内的位置只取决于自身页码（恒定），整条条带共用一个 offset。
+                // 不能给每页各自算 `(page − settled) × width + drag` 再各自动画：
+                // 连续翻页时动画中途新插入的页（落位预物化的目标页 / 键盘翻页的新邻页）
+                // 直接出现在终值位置，而存量页仍带着上一段动画的残余位移，
+                // 两者失步 → 后一页提前滑入视口叠在当前页上。
+                ZStack(alignment: .topLeading) {
+                    ForEach(windowStart..<max(windowEnd, windowStart + 1), id: \.self) { pageIndex in
+                        PageGridView(
+                            pageIndex: pageIndex,
+                            focusedSlot: pageIndex == model.currentPage ? gridFocus.focusedIndex : nil
+                        )
+                        .frame(width: width, height: proxy.size.height)
+                        .offset(x: PageStripLayout.pageOffset(pageIndex: pageIndex, width: width))
+                        // 进出窗口不做过渡：页本就在视口外增删，淡入淡出只会留下残影
+                        .transition(.identity)
+                    }
                 }
+                .frame(width: width, height: proxy.size.height, alignment: .topLeading)
+                .offset(x: PageStripLayout.stripOffset(
+                    settledIndex: settledIndex, width: width, dragOffset: model.pageDragOffset
+                ))
 
                 marqueeOverlay(in: proxy)
             }
@@ -469,6 +481,23 @@ struct PagedGridArea: View {
                     model.marqueeRect = nil
                 }
             }
+    }
+}
+
+/// 窗口化页面带的几何（纯逻辑，便于单测）。
+///
+/// 页在条带内的位置只由页码决定、与 settled / 拖拽无关；视口内的渲染原点
+/// = `pageOffset + stripOffset = (page − settled) × width + drag`。
+/// 动画只作用在唯一的 `stripOffset` 上，窗口增删页不会造成页与页之间失步。
+enum PageStripLayout {
+    /// 页在条带内的固定位置。
+    static func pageOffset(pageIndex: Int, width: CGFloat) -> CGFloat {
+        CGFloat(pageIndex) * width
+    }
+
+    /// 整条条带的偏移：让 settled 页落在视口原点，再叠加跟手偏移。
+    static func stripOffset(settledIndex: Int, width: CGFloat, dragOffset: CGFloat) -> CGFloat {
+        -CGFloat(settledIndex) * width + dragOffset
     }
 }
 

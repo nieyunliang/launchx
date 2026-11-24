@@ -206,6 +206,10 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self, let app = self.store.state.layout.apps[appID] else { return }
             self.uninstallController.show(app: app, layoutStore: self.store)
         }
+        // 卸载成功由模型层收尾（选择集 / 打开态文件夹），而不是卸载器直接改布局（P2-9）
+        uninstallController.onUninstalled = { [weak self] appID in
+            self?.launchpadModel.appDidGetUninstalled(appID: appID)
+        }
         launchpadModel.onDismiss = { [weak self] in
             self?.launchpadController.hide()
         }

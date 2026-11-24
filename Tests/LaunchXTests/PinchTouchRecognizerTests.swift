@@ -5,7 +5,7 @@ import Testing
 // MARK: - 原始触点捏合识别器（合成触点帧回归）
 //
 // 阈值口径见 PinchTouchThresholds：minContacts=4、movementFloor=0.06、
-// vetoRatio=0.40、emitFloor=0.05、fullTrip=0.30、sessionCooldown=0.25s、
+// vetoRatio=0.32、emitFloor=0.05、fullTrip=0.30、sessionCooldown=0.25s、
 // releaseTrim=24ms（松手终值去尾）、dropoutGrace=24ms（失触宽限）。
 // 场景几何按 2026-11-21 真机带标签实测构造：滑动 ratio 0.10~0.21、
 // 捏合 ratio 0.59~1.52，判别式 spreadDelta / maxFingerMove。
@@ -287,7 +287,7 @@ struct PinchTouchRecognizerTests {
 
     /// 投递中转为平移（跨度冻结、位移猛增）→ cancelled，供窗口层回退。
     /// O1 语义保留：峰值判据只豁免「反向过零 / 漂移」，真正的滑动仍要取消
-    /// （峰值 0.116 → 平移约 0.29 后比值跌破 0.40，依旧 cancelled）。
+    /// （峰值 0.116 → 平移约 0.29 后比值跌破 vetoRatio，依旧 cancelled）。
     @Test func translationMidSessionDeliversCancelled() {
         let recognizer = PinchTouchRecognizer()
         let ids: [Int32] = [1, 2, 3, 4]
@@ -310,6 +310,60 @@ struct PinchTouchRecognizerTests {
             Issue.record("末事件应为 cancelled：\(events)")
             return
         }
+    }
+
+    // MARK: 拇指主导捏合（「偶尔捏了没反应」回归，2026-11-24）
+
+    /// 拇指 + 三指、三指基本不动、拇指带弧线向上收：平均两两间距里三条指-指
+    /// 间距不变，拇指位移被稀释一半，过门前 ratio 最低约 0.38。旧阈值 0.40
+    /// 在此静默否决（一个事件都没有）；新阈值下必须过识别门并跟手。
+    @Test func thumbDominantPinchWithArcIsNotVetoed() {
+        let recognizer = PinchTouchRecognizer()
+        let fingers: [(Int32, Float, Float)] = [(2, 0.40, 0.60), (3, 0.50, 0.62), (4, 0.60, 0.60)]
+        func frame(d: Float, state: Int32) -> [TouchSample] {
+            // 拇指每上移 1 单位横移 0.5 单位（手腕转动带出的弧线）
+            [touch(1, state, 0.50 + 0.5 * d, 0.35 + d)] + fingers.map { touch($0.0, state, $0.1, $0.2) }
+        }
+        var frames: [[TouchSample]] = [frame(d: 0, state: 3)]
+        for i in 1...40 {
+            frames.append(frame(d: Float(i) * 0.004, state: 4))
+        }
+        var now: TimeInterval = 1000
+        var events: [PinchGestureEvent] = []
+        for f in frames {
+            let outcome = recognizer.ingest(f, now: now)
+            #expect(!outcome.vetoed, "拇指主导捏合不得被位移否决（t=\(now)）")
+            events.append(contentsOf: outcome.events)
+            now += 0.008
+        }
+        #expect(events.first?.phase == .began, "应过识别门：\(events)")
+        #expect(events.contains { $0.phase == .changed && $0.signedProgress > 0 }, "捏拢应给正进度（展开面板）")
+    }
+
+    /// 阈值下调后的对照：三指横向滑动 + 拇指搭板不动（Dock 切空间的典型接触场）
+    /// 在位移刚越过 floor 时 ratio ≈ 0.20，仍必须静默否决。
+    @Test func horizontalSwipeWithRestingThumbStillVetoed() {
+        let recognizer = PinchTouchRecognizer()
+        func frame(dx: Float, state: Int32) -> [TouchSample] {
+            [touch(1, state, 0.45, 0.38),
+             touch(2, state, 0.40 + dx, 0.50), touch(3, state, 0.50 + dx, 0.50), touch(4, state, 0.60 + dx, 0.50)]
+        }
+        var frames: [[TouchSample]] = [frame(dx: 0, state: 3)]
+        for i in 1...40 {
+            frames.append(frame(dx: Float(i) * 0.005, state: 4))
+        }
+        frames.append([])
+        var vetoed = false
+        var now: TimeInterval = 1000
+        var events: [PinchGestureEvent] = []
+        for f in frames {
+            let outcome = recognizer.ingest(f, now: now)
+            vetoed = vetoed || outcome.vetoed
+            events.append(contentsOf: outcome.events)
+            now += 0.008
+        }
+        #expect(vetoed, "拇指搭板的三指横滑必须触发位移否决")
+        #expect(events.isEmpty, "滑动不得产生任何手势事件：\(events)")
     }
 
     // MARK: P0 优化回归（docs/pinch-gesture-optimization.md）
