@@ -562,6 +562,20 @@ struct HardeningRegressionTests {
         #expect(menu.isTemplate)
         #expect(menu.tiffRepresentation != nil)
     }
+
+    /// 程序坞图标遵循苹果图标网格：底板四周留透明边，不铺满画布（否则比其他应用图标大一圈）。
+    @Test func dockIconLeavesSystemGridPadding() throws {
+        let dock = AppIconRenderer.appIcon(for: .brand, dark: true)
+        let tiff = try #require(dock.tiffRepresentation)
+        let rep = try #require(NSBitmapImageRep(data: tiff))
+        let w = rep.pixelsWide, h = rep.pixelsHigh
+        // 边缘中点（底板外的透明边）应全透明；画布中心应不透明。
+        let pad = Int(CGFloat(w) * AppIconRenderer.gridInsetRatio / 3)
+        for (x, y) in [(w / 2, pad), (pad, h / 2), (w - 1 - pad, h / 2)] {
+            #expect((rep.colorAt(x: x, y: y)?.alphaComponent ?? 1) < 0.05)
+        }
+        #expect((rep.colorAt(x: w / 2, y: h / 2)?.alphaComponent ?? 0) > 0.95)
+    }
 }
 
 // MARK: - 批次 3：窗口层级（相对全屏面板）

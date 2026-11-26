@@ -797,15 +797,26 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
             )
         case .ended:
             guard pinchStartVisible != nil else { return }
-            settlePinchGesture(finalProgress: event.signedProgress, cancelled: false)
+            settlePinchGesture(finalProgress: event.signedProgress, velocity: event.velocity, cancelled: false)
         case .cancelled:
             guard pinchStartVisible != nil else { return }
             settlePinchGesture(finalProgress: nil, cancelled: true)
         }
     }
 
-    nonisolated static func shouldCommitPinch(progress: CGFloat, cancelled: Bool) -> Bool {
-        !cancelled && abs(progress) >= 0.5
+    /// 是否按终帧方向提交：过半，或快甩（速度够快、方向背离零点、行程不太短）。
+    /// 回归（2026-11-25 真机 trace）：快速捏合整段只有 40~70ms，松手时进度
+    /// 0.35~0.47 但速度 5~9/s——只看位置会全部弹回，用户感知为「捏了不灵」。
+    /// 往零点方向快甩（速度与进度反号且 ≥ flingVelocity）是撤回意图：无论是否
+    /// 过半都不提交——过半后快速往回收再松手，用户要的是取消，不是落到终帧方向。
+    nonisolated static func shouldCommitPinch(progress: CGFloat, velocity: CGFloat = 0, cancelled: Bool) -> Bool {
+        guard !cancelled else { return false }
+        let fast = abs(velocity) >= PinchTouchThresholds.flingVelocity
+        if fast && progress * velocity < 0 { return false }
+        if abs(progress) >= 0.5 { return true }
+        return fast
+            && abs(progress) >= PinchTouchThresholds.flingMinProgress
+            && progress * velocity > 0
     }
 
     /// 会话内视觉过渡进度（0=收起，1=展开，与内容视图 transitionProgress 同口径）：
@@ -840,11 +851,12 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
     }
 
     /// 松手后从当前表现值继续弹簧落位，不重新播放完整动画。
-    /// |终帧进度| ≥ 0.5 按终帧方向落位（张开 → 展开、捏合 → 收起）——会话中途反向后，
-    /// 终帧方向即用户最终意图；未过半或系统取消回退到会话起点的可见性。
-    private func settlePinchGesture(finalProgress: CGFloat?, cancelled: Bool, animated: Bool = true) {
+    /// |终帧进度| ≥ 0.5 或快甩（见 shouldCommitPinch）按终帧方向落位（张开 → 展开、
+    /// 捏合 → 收起）——会话中途反向后，终帧方向即用户最终意图；未过半且非快甩、
+    /// 往零点方向快甩、或系统取消，回退到会话起点的可见性。
+    private func settlePinchGesture(finalProgress: CGFloat?, velocity: CGFloat = 0, cancelled: Bool, animated: Bool = true) {
         guard let startVisible = pinchStartVisible else { return }
-        let commit = Self.shouldCommitPinch(progress: finalProgress ?? 0, cancelled: cancelled)
+        let commit = Self.shouldCommitPinch(progress: finalProgress ?? 0, velocity: velocity, cancelled: cancelled)
         let targetVisible = commit ? (finalProgress ?? 0) > 0 : startVisible
         let update = {
             self.model.pinchTransitionProgress = nil

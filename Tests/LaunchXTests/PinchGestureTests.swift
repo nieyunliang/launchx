@@ -78,6 +78,52 @@ struct PinchVisualProgressTests {
     }
 }
 
+/// 提交判定真值表（2026-11-25 真机 trace 回归：快速捏合松手时未过半但速度很快）。
+@Suite
+struct PinchCommitDecisionTests {
+    private func commit(_ p: CGFloat, _ v: CGFloat, cancelled: Bool = false) -> Bool {
+        LaunchpadWindowController.shouldCommitPinch(progress: p, velocity: v, cancelled: cancelled)
+    }
+
+    @Test func slowPastHalfCommits() {
+        #expect(commit(0.6, 0))
+        #expect(commit(-0.5, 0))
+    }
+
+    @Test func slowBelowHalfRollsBack() {
+        #expect(!commit(0.45, 1.0))
+        #expect(!commit(-0.3, -2.0))
+    }
+
+    /// 真机样本：p=0.35~0.47、v=5.3~8.8/s 的快捏，原先全部弹回。
+    @Test func fastFlickBelowHalfCommits() {
+        #expect(commit(0.46, 5.32))
+        #expect(commit(-0.35, -8.75))
+        #expect(commit(-0.40, -7.25))
+    }
+
+    /// 往零点方向甩 = 撤回意图（真机样本：峰值 0.84 后回收到 0.35，v=-3.75/s）。
+    @Test func flickTowardZeroDoesNotCommit() {
+        #expect(!commit(0.35, -3.75))
+        #expect(!commit(-0.4, 6.0))
+    }
+
+    /// 过半后往零点快甩同样是撤回；过半后慢速回落仍按终帧方向提交。
+    @Test func fastFlickTowardZeroPastHalfDoesNotCommit() {
+        #expect(!commit(0.6, -6.0))
+        #expect(!commit(-0.8, 4.0))
+        #expect(commit(0.6, -2.0))
+    }
+
+    @Test func tooShortFlickDoesNotCommit() {
+        #expect(!commit(0.2, 9.0))
+    }
+
+    @Test func cancelledNeverCommits() {
+        #expect(!commit(0.9, 9.0, cancelled: true))
+    }
+}
+
 @MainActor
 struct PinchCloseSessionTests {
 

@@ -27,6 +27,21 @@ let k = s / 512.0
 func pt(_ x: Double, _ y: Double) -> CGPoint { CGPoint(x: x * k, y: (512 - y) * k) }
 func len(_ v: Double) -> CGFloat { CGFloat(v * k) }
 
+// ---- 苹果 macOS 图标网格：1024 画布中底板 824×824，四周各留 100 透明边 ----
+// （底板铺满画布会让程序坞里的图标比其他应用大一圈；与 AppIconRenderer 保持一致）
+let inset = s * 100.0 / 1024.0
+let content = s - 2 * inset
+// 底板落影：底板整体画进带阴影的透明层（阴影取合成轮廓，不另垫黑底，避免
+// 抗锯齿边缘透黑出现暗边）。阴影参数在设备像素度量、不随 CTM 缩放。
+ctx.saveGState()
+ctx.setShadow(offset: CGSize(width: 0, height: -s * 10 / 1024), blur: s * 20 / 1024,
+              color: CGColor(red: 0, green: 0, blue: 0, alpha: 0.30))
+ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+ctx.translateBy(x: inset, y: inset)
+ctx.scaleBy(x: content / s, y: content / s)
+// 缩进后的阴影换算比例：瓦片阴影按底板缩放同比缩小，与图形保持原设计比例。
+let shadowScale = content / s
+
 // ---- 圆角方形底板 + 深空渐变 ----
 let radius = 116.0 * k
 let board = CGPath(roundedRect: CGRect(x: 0, y: 0, width: s, height: s),
@@ -86,7 +101,7 @@ for row in 0..<3 {
 
         ctx.saveGState()
         // 瓦片落影：先带阴影填充，再裁剪进路径画渐变
-        ctx.setShadow(offset: CGSize(width: 0, height: len(-7)), blur: len(12),
+        ctx.setShadow(offset: CGSize(width: 0, height: len(-7) * shadowScale), blur: len(12) * shadowScale,
                       color: CGColor(red: 0.02, green: 0.03, blue: 0.12, alpha: 0.50))
         ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
         ctx.addPath(path)
@@ -119,6 +134,8 @@ for row in 0..<3 {
 }
 
 ctx.restoreGState() // board clip
+ctx.endTransparencyLayer()
+ctx.restoreGState() // board shadow
 
 // ---- 输出 PNG ----
 let image = ctx.makeImage()!

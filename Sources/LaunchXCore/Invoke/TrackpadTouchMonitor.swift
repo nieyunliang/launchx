@@ -50,10 +50,14 @@ public enum PinchGestureEventPhase: Sendable {
 public struct PinchGestureEvent: Sendable {
     public let phase: PinchGestureEventPhase
     public let signedProgress: CGFloat
+    /// 有符号进度的变化速度（进度/秒），只在 ended 上有意义（截止到终值所取
+    /// 样本、PinchTouchThresholds.velocityWindow 窗口内的最小二乘斜率）；其余为 0。
+    public let velocity: CGFloat
 
-    public init(phase: PinchGestureEventPhase, signedProgress: CGFloat) {
+    public init(phase: PinchGestureEventPhase, signedProgress: CGFloat, velocity: CGFloat = 0) {
         self.phase = phase
         self.signedProgress = signedProgress
+        self.velocity = velocity
     }
 }
 
@@ -99,9 +103,20 @@ enum PinchTouchThresholds {
     static let fullTrip: Float = 0.30
     /// 会话结束后允许新候选的冷却期（防止同批触点立刻重开会话）。
     static let sessionCooldown: TimeInterval = 0.25
-    /// 松手终值去尾窗口：ended 取「松手前该时长之前」最近的进度样本
-    /// （≈3 帧，覆盖逐指抬起造成的张开度回落）。
+    /// 松手终值去尾窗口（≈3 帧，从最后一个进度样本倒推）：只用来**剔除回落**——
+    /// 末样本比窗口前的锚点更小（逐指抬起的张开度回落）就取锚点；仍在增长就取
+    /// 末样本（窗口中间的冲高不参与，不做峰值保持）。
+    /// 2026-11-25 真机 trace：快速捏合整段只有 40~70ms、5~9 帧，松手前进度
+    /// 单调上升、没有一例回落；旧实现无条件扔掉最后 24ms，等于砍掉一半行程，
+    /// 34 次里有 7 次峰值已过 0.5 却被判成未过半弹回。
     static let releaseTrim: TimeInterval = 0.024
+    /// 松手速度估计窗口（≈6 帧最小二乘斜率，截止到终值所取样本，不含去尾剔除的回落帧）。
+    static let velocityWindow: TimeInterval = 0.048
+    /// 快甩提交：松手速度 ≥ 此值（进度/秒）、方向背离零点、进度 ≥ flingMinProgress
+    /// 即按速度方向提交。真机 trace：慢速跟手松手时 0~2.5/s，快速捏合 4.5~9.4/s；
+    /// 未过半的快捏（0.35~0.47）全部 ≥ 5.3/s。取 3.0 留出余量。
+    static let flingVelocity: CGFloat = 3.0
+    static let flingMinProgress: CGFloat = 0.25
     /// 进度历史保留窗口（松手去尾取值用；后续速度估计共用同一缓冲）。
     static let historyWindow: TimeInterval = 0.15
     /// 失触宽限：会话成员短暂失触（帧内消失且无 breakTouch）不超过此值
@@ -167,7 +182,7 @@ final class PinchTouchRecognizer: @unchecked Sendable {
         var state: Int32
     }
 
-    private struct ProgressSample {
+    struct ProgressSample {
         let t: TimeInterval
         let p: CGFloat
     }
@@ -358,10 +373,10 @@ final class PinchTouchRecognizer: @unchecked Sendable {
     /// 会话正常收尾（松手 / 失触超宽限）：投递中则补 ended，终值按松手去尾。
     private func endSession(now: TimeInterval, reason: String, into outcome: inout IngestOutcome) {
         if sessionEmitting {
-            let final = trimmedEndProgress(now: now)
-            outcome.events.append(PinchGestureEvent(phase: .ended, signedProgress: final))
+            let (final, velocity) = Self.releaseEstimate(history: history, fallback: lastProgress)
+            outcome.events.append(PinchGestureEvent(phase: .ended, signedProgress: final, velocity: velocity))
             if TrackpadTouchMonitor.traceEnabled {
-                TrackpadTouchMonitor.trace("SESSION-END reason=\(reason) final=\(String(format: "%.2f", Double(final))) peak=\(String(format: "%.3f", peakAbsDelta))")
+                TrackpadTouchMonitor.trace("SESSION-END reason=\(reason) final=\(String(format: "%.2f", Double(final))) v=\(String(format: "%.2f", Double(velocity))) peak=\(String(format: "%.3f", peakAbsDelta))")
             }
         } else if TrackpadTouchMonitor.traceEnabled {
             // 未过识别门就松手：张开度没攒够 emitFloor（捏得太轻 / 起步太慢）。
@@ -370,17 +385,55 @@ final class PinchTouchRecognizer: @unchecked Sendable {
         closeSession(now: now)
     }
 
-    /// ended 终值：取松手前 releaseTrim 时刻之前最近的进度样本（O3-A 去尾）。
-    /// 松手是逐指抬起的，最后几帧接触面缩小、张开度往回掉，直接取末帧会让
-    /// 本来过半的捏合掉到提交线以下；不用峰值保持——用户最后时刻主动往回收
-    /// （想取消）时峰值会把取消误判成提交，去尾取值没有这个偏差。
-    /// 历史不足（样本全部落在去尾窗口内）时退回 lastProgress。
-    private func trimmedEndProgress(now: TimeInterval) -> CGFloat {
-        let cut = now - PinchTouchThresholds.releaseTrim
-        if let sample = history.last(where: { $0.t < cut }) {
-            return sample.p
+    /// ended 终值与松手速度（O3-A 去尾，只剔回落）。
+    ///
+    /// 时间基准取**最后一个进度样本**而非会话结束时刻：失触路径要等
+    /// dropoutGrace 才收尾，零触点帧还可能停发直到下次落指，按结束时刻倒推
+    /// 会让窗口落空、速度归零。
+    ///
+    /// 终值：锚点 = 末样本前 releaseTrim 之外最近的样本；取「锚点 / 末样本」中
+    /// 沿末样本方向幅度更大的一个——
+    /// - 逐指抬起造成回落：末样本更小 → 取锚点，过半的捏合不被拖到线下；
+    /// - 快速捏合松手前仍在增长：末样本更大 → 取末样本，不砍掉真实行程；
+    /// - 窗口内先冲高再回收：中间的冲高不参与（不做峰值保持），取锚点；
+    /// - 窗口内过零反向：方向以末样本为准，锚点反号时直接取末样本。
+    /// 用户在松手前超过 releaseTrim 主动往回收时，锚点已落在回收段上，
+    /// 取消不会被峰值误判成提交。
+    ///
+    /// 速度：截止到终值所取样本、向前 velocityWindow 内的最小二乘斜率——
+    /// 被去尾剔除的回落帧不参与拟合，抬手滑移不会把快甩速度拉低或翻号。
+    ///
+    /// 历史不足（无样本）时退回 fallback（lastProgress）、速度 0。
+    static func releaseEstimate(history: [ProgressSample], fallback: CGFloat) -> (progress: CGFloat, velocity: CGFloat) {
+        guard let lastIndex = history.indices.last else { return (fallback, 0) }
+        let end = history[lastIndex]
+        let cut = end.t - PinchTouchThresholds.releaseTrim
+        var pick = lastIndex
+        if let anchor = history.lastIndex(where: { $0.t < cut }) {
+            let sign: CGFloat = end.p >= 0 ? 1 : -1
+            if history[anchor].p * sign > end.p * sign {
+                pick = anchor
+            }
         }
-        return lastProgress
+        return (history[pick].p, slope(of: history[...pick], until: history[pick].t))
+    }
+
+    /// 截止 until、向前 velocityWindow 内样本的最小二乘斜率（进度/秒），
+    /// 比首尾差分抗单帧抖动。样本不足 2 个返回 0。
+    private static func slope(of samples: ArraySlice<ProgressSample>, until: TimeInterval) -> CGFloat {
+        let window = samples.filter { $0.t >= until - PinchTouchThresholds.velocityWindow }
+        guard window.count >= 2 else { return 0 }
+        let n = Double(window.count)
+        let meanT = window.reduce(0) { $0 + $1.t } / n
+        let meanP = window.reduce(0) { $0 + Double($1.p) } / n
+        var num = 0.0
+        var den = 0.0
+        for sample in window {
+            let dt = sample.t - meanT
+            num += dt * (Double(sample.p) - meanP)
+            den += dt * dt
+        }
+        return den > 0 ? CGFloat(num / den) : 0
     }
 
     /// 外部中止（设备停止 / 重置）：投递中的会话补发 cancelled，供窗口层回退

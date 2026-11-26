@@ -312,6 +312,91 @@ struct PinchTouchRecognizerTests {
         }
     }
 
+    // MARK: 快速捏合（2026-11-25 真机 trace 回归）
+
+    /// 整段约 60ms 的快捏，松手前进度单调上升：终值不得被去尾砍掉一截，
+    /// 且 ended 必须带出速度供快甩提交。旧实现无条件取「松手 24ms 前」的样本，
+    /// 终值约 0.26，比真实行程少一半。
+    @Test func fastPinchKeepsRisingTailAndReportsVelocity() {
+        let recognizer = PinchTouchRecognizer()
+        let ids: [Int32] = [1, 2, 3, 4]
+        var frames: [[TouchSample]] = [crossFrame(ids: ids, k: 1.0, state: 3, span: 0.12)]
+        for i in 1...7 {
+            frames.append(crossFrame(ids: ids, k: 1.0 - Float(i) * 0.1, span: 0.12))
+        }
+        frames.append(crossFrame(ids: ids, k: 0.3, state: 5, span: 0.12))
+        frames.append([])
+
+        let events = run(recognizer, frames: frames)
+        guard let last = events.last, last.phase == .ended else {
+            Issue.record("末事件应为 ended：\(events)")
+            return
+        }
+        let peak = events.filter { $0.phase == .changed }.map(\.signedProgress).max() ?? 0
+        #expect(abs(last.signedProgress - peak) < 0.01,
+                "单调上升的快捏终值应等于末段进度（终值 \(last.signedProgress)，峰值 \(peak)）")
+        #expect(last.velocity > PinchTouchThresholds.flingVelocity, "速度应识别为快甩（实际 \(last.velocity)）")
+        #expect(LaunchpadWindowController.shouldCommitPinch(
+            progress: last.signedProgress, velocity: last.velocity, cancelled: false))
+    }
+
+    /// 快捏后经失触路径收尾（无 state≥5 明确抬指），且零触点帧停发、直到 2s 后
+    /// 下次落指才收尾：速度窗口须以末样本为基准，不能按收尾时刻倒推落空成 0。
+    @Test func fastPinchEndingViaLateDropoutKeepsVelocity() {
+        let recognizer = PinchTouchRecognizer()
+        let ids: [Int32] = [1, 2, 3, 4]
+        var events: [PinchGestureEvent] = []
+        var now: TimeInterval = 1000
+        func feed(_ frame: [TouchSample], advance: TimeInterval = 0.008) {
+            events.append(contentsOf: recognizer.ingest(frame, now: now).events)
+            now += advance
+        }
+        feed(crossFrame(ids: ids, k: 1.0, state: 3, span: 0.12))
+        for i in 1...6 {
+            feed(crossFrame(ids: ids, k: 1.0 - Float(i) * 0.1, span: 0.12))
+        }
+        feed([], advance: 2.0)   // 手指消失（失触），之后 MT 帧停发
+        feed([])                 // 2s 后才来下一帧，此时才按失触收尾
+
+        guard let last = events.last, last.phase == .ended else {
+            Issue.record("末事件应为 ended：\(events)")
+            return
+        }
+        #expect(last.velocity > PinchTouchThresholds.flingVelocity, "失触收尾也应带出快甩速度（实际 \(last.velocity)）")
+    }
+
+    // MARK: 松手终值 / 速度估计（releaseEstimate 纯函数）
+
+    private func estimate(_ samples: [(TimeInterval, CGFloat)]) -> (progress: CGFloat, velocity: CGFloat) {
+        PinchTouchRecognizer.releaseEstimate(
+            history: samples.map { PinchTouchRecognizer.ProgressSample(t: 1000 + $0.0, p: $0.1) },
+            fallback: samples.last?.1 ?? 0)
+    }
+
+    /// 快捏上升后抬手滑移回落：终值取回落前的锚点，速度只拟合到锚点——
+    /// 滑移帧不得把速度拉到快甩阈值以下（旧实现拟合含滑移，≈1.5/s 弹回）。
+    @Test func liftSlipDoesNotDragDownVelocity() {
+        let r = estimate([(0.000, 0.25), (0.010, 0.40), (0.020, 0.45),
+                          (0.030, 0.42), (0.040, 0.38), (0.050, 0.35)])
+        #expect(r.progress >= 0.40, "终值应取回落前的值（实际 \(r.progress)）")
+        #expect(r.velocity > PinchTouchThresholds.flingVelocity, "速度不应被滑移拉低（实际 \(r.velocity)）")
+        #expect(LaunchpadWindowController.shouldCommitPinch(progress: r.progress, velocity: r.velocity, cancelled: false))
+    }
+
+    /// 去尾窗口内先冲高再回收：中间的冲高不参与终值（不做峰值保持）。
+    @Test func overshootInsideTrimWindowIsNotPeakHeld() {
+        let r = estimate([(0.000, 0.40), (0.010, 0.45), (0.020, 0.55), (0.030, 0.30)])
+        #expect(r.progress < 0.5, "窗口内冲高不得被取作终值（实际 \(r.progress)）")
+    }
+
+    /// 窗口内过零反向快甩：方向以末样本为准，不按锚点方向丢掉过零后的行程。
+    @Test func zeroCrossingInsideTrimWindowFollowsLastSample() {
+        let r = estimate([(0.000, -0.10), (0.010, -0.05), (0.020, 0.20), (0.030, 0.42)])
+        #expect(abs(r.progress - 0.42) < 0.001, "过零后应取末样本（实际 \(r.progress)）")
+        #expect(r.velocity > 0)
+        #expect(LaunchpadWindowController.shouldCommitPinch(progress: r.progress, velocity: r.velocity, cancelled: false))
+    }
+
     // MARK: 拇指主导捏合（「偶尔捏了没反应」回归，2026-11-24）
 
     /// 拇指 + 三指、三指基本不动、拇指带弧线向上收：平均两两间距里三条指-指

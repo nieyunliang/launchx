@@ -26,12 +26,39 @@ enum AppIconRenderer {
         let side: CGFloat = 128
         let palette = Self.palette(for: theme, dark: dark)
         return Self.drawingIcon(size: NSSize(width: side, height: side)) { ctx in
+            // 苹果 macOS 图标网格：1024 画布中底板占 824×824、四周各留 100 透明边，
+            // 否则底板铺满画布，程序坞里会比其他应用图标大一圈。
+            let inset = side * Self.gridInsetRatio
+            let content = side - 2 * inset
+            ctx.saveGState()
+            // 底板落影（与系统图标模板一致：向下偏移、轻微模糊）：底板整体画进
+            // 带阴影的透明层，阴影取合成后的轮廓——不另垫黑色底板，否则底板
+            // 抗锯齿边缘会透出黑底，浅色主题下出现一圈暗边。
+            Self.setScaledShadow(in: ctx, offset: -side * 10 / 1024, blur: side * 20 / 1024,
+                                 color: CGColor(red: 0, green: 0, blue: 0, alpha: 0.30))
+            ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+            ctx.translateBy(x: inset, y: inset)
+            ctx.scaleBy(x: content / side, y: content / side)
             Self.drawBoard(in: ctx, side: side, palette: palette)
             Self.drawTiles(in: ctx, side: side, palette: palette)
             if palette.rocketCenter {
                 Self.drawRocketBadge(in: ctx, side: side, rows: palette.tiles.count)
             }
+            ctx.endTransparencyLayer()
+            ctx.restoreGState()
         }
+    }
+
+    /// 底板四周透明边占画布边长的比例（苹果模板：100 / 1024）。
+    nonisolated static let gridInsetRatio: CGFloat = 100.0 / 1024.0
+
+    /// 按用户空间单位设置阴影。CGContext 的阴影偏移与模糊在基空间（设备像素）
+    /// 度量、不随 CTM 缩放：底板缩进网格后、或 2x 屏绘制时，直接传用户空间值
+    /// 会让阴影相对图形偏大 / 偏小。这里按当前 CTM 的缩放比换算到设备像素。
+    private static func setScaledShadow(in ctx: CGContext, offset dy: CGFloat, blur: CGFloat, color: CGColor) {
+        let t = ctx.userSpaceToDeviceSpaceTransform
+        let scale = (t.a * t.a + t.b * t.b).squareRoot()
+        ctx.setShadow(offset: CGSize(width: 0, height: dy * scale), blur: blur * scale, color: color)
     }
 
     // MARK: - 菜单栏模板图标
@@ -186,8 +213,8 @@ enum AppIconRenderer {
                                   cornerHeight: tileRadius * k, transform: nil)
 
                 ctx.saveGState()
-                ctx.setShadow(offset: CGSize(width: 0, height: -7 * k), blur: 12 * k,
-                              color: CGColor(red: 0.02, green: 0.03, blue: 0.12, alpha: 0.50))
+                Self.setScaledShadow(in: ctx, offset: -7 * k, blur: 12 * k,
+                                     color: CGColor(red: 0.02, green: 0.03, blue: 0.12, alpha: 0.50))
                 ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
                 ctx.addPath(path)
                 ctx.fillPath()
@@ -232,8 +259,8 @@ enum AppIconRenderer {
         let drawRect = CGRect(x: cx - base.size.width / 2, y: cy - base.size.height / 2,
                               width: base.size.width, height: base.size.height)
         ctx.saveGState()
-        ctx.setShadow(offset: CGSize(width: 0, height: -1.5 * k), blur: 3 * k,
-                      color: CGColor(red: 0.30, green: 0.10, blue: 0.0, alpha: 0.35))
+        Self.setScaledShadow(in: ctx, offset: -1.5 * k, blur: 3 * k,
+                             color: CGColor(red: 0.30, green: 0.10, blue: 0.0, alpha: 0.35))
         tinted.draw(in: drawRect)
         ctx.restoreGState()
     }
