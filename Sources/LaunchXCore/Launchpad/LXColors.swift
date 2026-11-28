@@ -7,19 +7,9 @@ public enum LXColors {
     /// 强调色：systemBlue (0, 0.533, 1)。
     public static let accent = Color(red: 0, green: 0.533, blue: 1)
 
-    /// Main：亮色白 / 暗色 (0.067, 0.067, 0.067)。
-    public static func main(_ dark: Bool) -> Color {
-        dark ? Color(white: 0.067) : .white
-    }
-
     /// GlassTint：全屏模式毛玻璃叠色（白 10% / 白 2%）。
     public static func glassTint(_ dark: Bool) -> Color {
         Color.white.opacity(dark ? 0.02 : 0.10)
-    }
-
-    /// SearchGlassTint：搜索框底（白 15%）。
-    public static var searchGlassTint: Color {
-        Color(white: 0.067, opacity: 0.15)
     }
 
     /// Highlight：图标按压/悬停高亮（黑 32%）。
@@ -49,7 +39,10 @@ public enum LXColors {
             : Color(red: 0xF1 / 255.0, green: 0x38 / 255.0, blue: 0x3D / 255.0)
     }
 
-    /// 当前是否暗色外观。
+    /// 当前是否暗色外观（读 NSApp，不进 SwiftUI 依赖）。
+    ///
+    /// 只给 AppKit 侧一次性取值用；SwiftUI 视图请读 `@Environment(\.colorScheme)`，
+    /// 否则面板打开期间切换深浅色不会重绘。
     @MainActor
     public static var isDark: Bool {
         NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
@@ -65,8 +58,7 @@ public extension View {
     /// interactive 提供悬停镜面响应；默认暗色 scrim（暗 0.22 / 亮 0.10）
     /// 保证白字在亮壁纸上可读，Toast 等强对比场景可传更深的 tint。
     func liquidGlassCapsule(tint: Color? = nil) -> some View {
-        let scrim = tint ?? Color.black.opacity(LXColors.isDark ? 0.22 : 0.10)
-        return self.glassEffect(.regular.tint(scrim).interactive(), in: Capsule())
+        modifier(LiquidGlassCapsule(tint: tint))
     }
 
     /// 圆角矩形 Liquid Glass 底（容器级：文件夹预览 / 打开态磨砂面板）。
@@ -77,6 +69,17 @@ public extension View {
             .regular.tint(tint),
             in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
         )
+    }
+}
+
+/// 胶囊玻璃底：默认 scrim 按环境深浅色取值，系统切换外观时随之重绘。
+private struct LiquidGlassCapsule: ViewModifier {
+    let tint: Color?
+    @Environment(\.colorScheme) private var colorScheme
+
+    func body(content: Content) -> some View {
+        let scrim = tint ?? Color.black.opacity(colorScheme == .dark ? 0.22 : 0.10)
+        content.glassEffect(.regular.tint(scrim).interactive(), in: Capsule())
     }
 }
 

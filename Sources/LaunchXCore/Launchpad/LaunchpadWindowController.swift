@@ -15,6 +15,22 @@ struct PageScrollEvent {
     var isMomentum: Bool
     /// 离散设备（phase 与 momentumPhase 均为空：鼠标横滚轮 / 普通滚轮）。
     var isDiscrete: Bool
+    /// 手势被系统取消（phase == .cancelled）：立即回弹，不等 idle 兜底。
+    var isCancelled: Bool = false
+    /// 手指放上但还没动（phase == .mayBegin）：不是手势开始，忽略。
+    var isMayBegin: Bool = false
+}
+
+/// 面板层用到的虚拟键码（kVK_*）。
+enum KeyCode {
+    static let `return`: UInt16 = 36
+    static let tab: UInt16 = 48
+    static let escape: UInt16 = 53
+    static let keypadEnter: UInt16 = 76
+    static let leftArrow: UInt16 = 123
+    static let rightArrow: UInt16 = 124
+    static let downArrow: UInt16 = 125
+    static let upArrow: UInt16 = 126
 }
 
 /// 交互式横滑翻页手势（纯逻辑，便于单测）。
@@ -32,6 +48,21 @@ struct InteractivePageGesture {
     static let rubberBandDimension: CGFloat = 100
     /// 离散滚轮事件的翻页冷却（秒）。
     static let discreteCooldown: TimeInterval = 0.35
+    /// 离散滚轮单次事件的最小横向幅度（pt；行单位的设备已先换算成 pt）。
+    static let discreteMinDelta: CGFloat = 4
+    /// 没有精确增量的设备（鼠标滚轮）`scrollingDeltaX` 的单位是「行」，滚一格常只有 1 左右，
+    /// 过不了面板过滤（>2pt）和离散阈值（>4pt）。按一行约 10pt 换算（NSScrollView 默认行距）。
+    static let lineScrollPoints: CGFloat = 10
+    /// 面板层方向过滤的最小横向幅度（pt）。
+    static let forwardMinDelta: CGFloat = 2
+    /// 越界橡皮筋衰减系数。
+    static let rubberBandCoefficient: CGFloat = 0.55
+    /// 速度 EMA：旧值权重 / 新样本权重。
+    static let velocitySmoothing: CGFloat = 0.7
+    /// 速度采样的 dt 下限（秒），避免单事件除零放大。
+    static let minSampleInterval: TimeInterval = 0.008
+    /// `timeoutSettle` 默认的空闲判定（秒）。
+    static let defaultIdleTimeout: TimeInterval = 0.3
 
     enum Action: Equatable {
         /// 事件未影响跟手偏移（惯性尾巴 / 已落位 / 冷却期离散事件）。
@@ -78,12 +109,12 @@ struct InteractivePageGesture {
     ) -> Bool {
         if isPagedBrowsing, isContinuousGesture { return true }
         if isGestureBoundary { return true }
-        return abs(deltaX) > abs(deltaY) && abs(deltaX) > 2
+        return abs(deltaX) > abs(deltaY) && abs(deltaX) > forwardMinDelta
     }
 
     /// 边界外渐近衰减：越界越多每 pt 增量越小，回滑时平滑恢复 1:1。
     private static func damp(magnitude: CGFloat) -> CGFloat {
-        let c: CGFloat = 0.55
+        let c = rubberBandCoefficient
         return (1 - 1 / (magnitude / rubberBandDimension * c + 1)) * rubberBandDimension
     }
 
@@ -91,6 +122,8 @@ struct InteractivePageGesture {
     ///
     /// `resumingFrom`：落位动画期间新手势接管的起始偏移（动画曲线表现值），
     /// 与本事件（.began）增量一并作为跟手起点；nil = 正常新手势从零起滑。
+    /// `isCancelled`：系统取消手势，跟手中立即回弹（`.settle(0)`）。
+    /// `isMayBegin`：手指放上未动，忽略（不当作新手势开始、不排兜底计时）。
     mutating func feed(
         delta: CGFloat,
         isGestureStart: Bool,
@@ -101,7 +134,9 @@ struct InteractivePageGesture {
         canGoForward forward: Bool,
         pageWidth: CGFloat,
         at now: Date,
-        resumingFrom: CGFloat? = nil
+        resumingFrom: CGFloat? = nil,
+        isCancelled: Bool = false,
+        isMayBegin: Bool = false
     ) -> Action {
         canGoBackward = backward
         canGoForward = forward
@@ -109,7 +144,7 @@ struct InteractivePageGesture {
         // 离散滚轮：单事件直接翻一页（冷却防连发）。
         // 离散通道独立于触控板手势，先清残留跟手偏移，落位动画从 0 起滑
         if isDiscrete {
-            guard abs(delta) > 4, now.timeIntervalSince(lastDiscreteAt) >= Self.discreteCooldown else { return .ignored }
+            guard abs(delta) > Self.discreteMinDelta, now.timeIntervalSince(lastDiscreteAt) >= Self.discreteCooldown else { return .ignored }
             lastDiscreteAt = now
             if !dragging { rawOffset = 0; velocity = 0 }
             if delta < 0, forward { return .settle(1) }
@@ -119,6 +154,17 @@ struct InteractivePageGesture {
 
         // 落位已在 .ended 决定，惯性尾巴不参与（也不同步偏移，rawOffset 是残留值）
         if isMomentum { return .ignored }
+
+        // 手指放上但没动：不是手势开始。原先会走 `!dragging` 分支被当成新手势、排兜底计时。
+        if isMayBegin { return .ignored }
+
+        // 系统取消（如手势被系统接管）：跟手中立即回弹，不再等 idle 兜底，页面不停在半截。
+        if isCancelled {
+            guard dragging, !settled else { return .ignored }
+            dragging = false
+            settled = true
+            return .settle(0)
+        }
 
         if isGestureStart || !dragging {
             // 新手势：.began；异常丢了首事件时把首个 changed 当开始。
@@ -134,9 +180,11 @@ struct InteractivePageGesture {
             // 速度 EMA（pt/s），dt 下限避免单事件除零放大。
             // .ended 的增量恒近 0，不参与采样（否则把甩动速度EMA拉低导致误判回弹）
             if !isEnded {
-                let dt = max(now.timeIntervalSince(lastSampleAt), 0.008)
+                let dt = max(now.timeIntervalSince(lastSampleAt), Self.minSampleInterval)
                 let instant = (rawOffset - lastSampleOffset) / dt
-                velocity = velocity == 0 ? instant : velocity * 0.7 + instant * 0.3
+                velocity = velocity == 0
+                    ? instant
+                    : velocity * Self.velocitySmoothing + instant * (1 - Self.velocitySmoothing)
             }
         }
         lastSampleAt = now
@@ -148,9 +196,16 @@ struct InteractivePageGesture {
         return decision(pageWidth: pageWidth, velocity: velocity)
     }
 
+    /// 跟手中（已开始、尚未落位）。
+    var isTracking: Bool { dragging && !settled }
+
+    /// 最近一次跟手采样时刻（兜底计时按它推算剩余空闲时间）。
+    var lastSampleDate: Date { lastSampleAt }
+
     /// 兜底：异常收不到 .ended（手势被系统打断等）时按当前进度落位（速度视为 0）。
-    mutating func timeoutSettle(pageWidth: CGFloat, at now: Date) -> Action {
-        guard !settled, now.timeIntervalSince(lastSampleAt) > 0.3 else { return .ignored }
+    /// `idle`：距最近一次采样超过该时长才算空闲。
+    mutating func timeoutSettle(pageWidth: CGFloat, at now: Date, idle: TimeInterval = defaultIdleTimeout) -> Action {
+        guard !settled, now.timeIntervalSince(lastSampleAt) > idle else { return .ignored }
         dragging = false
         settled = true
         return decision(pageWidth: pageWidth, velocity: 0)
@@ -171,7 +226,7 @@ struct InteractivePageGesture {
 
 /// 面板层键盘 / 滚轮事件处理器集合（由窗口控制器装配）。
 @MainActor
-final class PanelKeyHandlers: @unchecked Sendable {
+final class PanelKeyHandlers {
     var onEscape: () -> Void = {}
     var onArrowLeft: () -> Void = {}
     var onArrowRight: () -> Void = {}
@@ -245,17 +300,17 @@ enum SearchFieldKeyRouter {
         // 输入法组字中：方向键用于选候选词、回车用于上屏，绝不拦截
         guard !hasMarkedText else { return .passThrough }
         switch keyCode {
-        case 126:  // ↑
+        case KeyCode.upArrow:
             guard !searchQuery.isEmpty, hitCount > 0 else { return .passThrough }
             // 两个方向都钳到有效范围：陈旧下标（结果集刚变小）不能让它停在范围外。
             return .moveSelection(min(max(selectedIndex - 1, 0), hitCount - 1))
-        case 125:  // ↓
+        case KeyCode.downArrow:
             guard !searchQuery.isEmpty, hitCount > 0 else { return .passThrough }
             return .moveSelection(min(max(selectedIndex, 0) + 1, hitCount - 1))
-        case 36, 76:  // Return / 小键盘 Enter
+        case KeyCode.return, KeyCode.keypadEnter:
             guard !searchQuery.isEmpty, hitCount > 0 else { return .passThrough }
             return .activate
-        case 48:  // Tab / Shift-Tab
+        case KeyCode.tab:  // Tab / Shift-Tab
             guard searchQuery.isEmpty else { return .passThrough }
             return .focusGrid(shifted: shiftPressed)
         default:
@@ -288,17 +343,17 @@ final class AlwaysKeyPanel: NSPanel {
     override func keyDown(with event: NSEvent) {
         MainActor.assumeIsolated {
             switch event.keyCode {
-            case 53:
+            case KeyCode.escape:
                 keyHandlers.onEscape()
-            case 123:
+            case KeyCode.leftArrow:
                 keyHandlers.onArrowLeft()
-            case 124:
+            case KeyCode.rightArrow:
                 keyHandlers.onArrowRight()
-            case 126:
+            case KeyCode.upArrow:
                 keyHandlers.onArrowUp()
-            case 125:
+            case KeyCode.downArrow:
                 keyHandlers.onArrowDown()
-            case 48:
+            case KeyCode.tab:
                 // Tab / Shift-Tab：搜索框聚焦时交给 field editor（系统在控件间移动焦点），
                 // 否则在网格应用之间移动键盘焦点（P3-4）。
                 if let responder = NSApp.keyWindow?.firstResponder as? NSTextView,
@@ -307,7 +362,7 @@ final class AlwaysKeyPanel: NSPanel {
                     return
                 }
                 keyHandlers.onTab(InteractionModifiers.normalized(event.modifierFlags).contains(.shift))
-            case 36, 76:
+            case KeyCode.return, KeyCode.keypadEnter:
                 // 输入法组字中 Return 用于上屏，不能当作「启动」
                 if let responder = NSApp.keyWindow?.firstResponder as? NSTextView,
                    responder.hasMarkedText() {
@@ -349,12 +404,14 @@ final class AlwaysKeyPanel: NSPanel {
         MainActor.assumeIsolated {
             // 触控板双指横滑 → 交互式翻页：事件带 phase 上报，
             // 由窗口控制器驱动页面跟手偏移与松手落位
-            let deltaX = event.scrollingDeltaX
-            let isBoundary = event.phase == .began || event.phase == .ended
+            // 鼠标滚轮等无精确增量的设备以「行」为单位，先换算成 pt 再参与阈值判断
+            let unit: CGFloat = event.hasPreciseScrollingDeltas ? 1 : InteractivePageGesture.lineScrollPoints
+            let deltaX = event.scrollingDeltaX * unit
+            let isBoundary = event.phase == .began || event.phase == .ended || event.phase == .cancelled
             let isContinuous = event.phase != [] || event.momentumPhase != []
             if InteractivePageGesture.shouldForward(
                 deltaX: deltaX,
-                deltaY: event.scrollingDeltaY,
+                deltaY: event.scrollingDeltaY * unit,
                 isGestureBoundary: isBoundary,
                 isContinuousGesture: isContinuous,
                 isPagedBrowsing: keyHandlers.isPagedBrowsing()
@@ -364,7 +421,9 @@ final class AlwaysKeyPanel: NSPanel {
                     isGestureStart: event.phase == .began,
                     isEnded: event.phase == .ended,
                     isMomentum: !event.momentumPhase.isEmpty,
-                    isDiscrete: event.phase.isEmpty && event.momentumPhase.isEmpty
+                    isDiscrete: event.phase.isEmpty && event.momentumPhase.isEmpty,
+                    isCancelled: event.phase == .cancelled,
+                    isMayBegin: event.phase == .mayBegin
                 ))
             } else {
                 super.scrollWheel(with: event)
@@ -548,8 +607,10 @@ enum PageSettleGuard {
     /// 方向键 / 页码点等翻页入口必须让路：否则新翻页立刻改 `currentPage`，
     /// 落位收尾的 `finishDragCommit(direction:)` 会在其上再提交一次，
     /// 表现为「按一次 → 跳两页」。
-    static func allowsNavigation(isSettlingPageDrag: Bool) -> Bool {
-        !isSettlingPageDrag
+    ///
+    /// 手指仍在跟手（偏移非零）时同理：先翻页，松手后再按偏移提交一次，同样跳两页。
+    static func allowsNavigation(isSettlingPageDrag: Bool, pageDragOffset: CGFloat) -> Bool {
+        !isSettlingPageDrag && abs(pageDragOffset) < 0.5
     }
 }
 
@@ -736,7 +797,9 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
     }
 
     /// 展开/收起动画共用的面板前置准备，不包含可见性状态切换。
-    private func prepareForShowing() {
+    /// `installMonitors`：捏合会话期间传 false——会话中途的屏幕变化 / 失焦不应触发
+    /// 自动收起，监听在会话落位到展开态时才装（与从展开态开始捏合的语义一致）。
+    private func prepareForShowing(installMonitors: Bool = true) {
         let screen = prepareWindow()
         scheduleWallpaperRefresh(for: screen)
         closeWorkItem?.cancel()
@@ -748,7 +811,7 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
         panel?.makeKey()
         Self.isOverlayOnScreen = true
         Self.updateChildWindowLevels()
-        installAutoHideMonitors()
+        if installMonitors { installAutoHideMonitors() }
     }
 
     /// 淡出或手势回退落位后统一下屏并持久化。
@@ -840,12 +903,15 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
         // 命中测试门（O9）：只在会话起止翻转，根视图不逐帧重算。
         model.isPinchInteracting = true
         if !model.isVisible {
-            prepareForShowing()
+            prepareForShowing(installMonitors: false)
             // isVisible 表示逻辑会话已开始；视觉仍完全由 pinchTransitionProgress 驱动。
             model.show()
         } else {
             cancelPageIdleSettle()
             pageGesture = InteractivePageGesture()
+            // 捏合打断横滑：面板随即不收鼠标事件，同一手势的 .ended 不会再送达，
+            // 跟手偏移必须在这里回弹，否则页面停在半截直到下一次横滑。
+            if model.pageDragOffset != 0 { model.settlePageDrag(commitDirection: 0) }
         }
         panel?.ignoresMouseEvents = true
     }
@@ -882,6 +948,7 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
         } else {
             wallpaperRefreshWork?.cancel()
             wallpaperRefreshWork = nil
+            gridFocus.clear()  // 与 hide() 一致：收起后键盘焦点不跨会话保留
             removeAutoHideMonitors()
             panel?.ignoresMouseEvents = true
             isHiding = true
@@ -1000,29 +1067,47 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
         panel.onUserInteraction = { [weak self] in
             self?.cancelAutoClose()
         }
+        // 收起淡出（约 0.4s）期间面板仍是 key window：各入口统一先过 acceptsPanelInput，
+        // 否则方向键会在 lastViewedPage 已保存后改页码、字符会写进搜索词、Esc 会再走一遍 hide()。
         handlers.onEscape = { [weak self] in
-            self?.handleEscapeKey()
+            guard let self, self.acceptsPanelInput else { return }
+            self.handleEscapeKey()
         }
-        handlers.onArrowLeft = { [weak self] in self?.handleArrow(.left) }
-        handlers.onArrowRight = { [weak self] in self?.handleArrow(.right) }
-        handlers.onArrowUp = { [weak self] in self?.handleArrow(.up) }
-        handlers.onArrowDown = { [weak self] in self?.handleArrow(.down) }
-        handlers.onTab = { [weak self] shifted in self?.handleTab(shiftedBy: shifted) }
-        handlers.onActivate = { [weak self] in self?.activateFocusedItem() }
+        handlers.onArrowLeft = { [weak self] in self?.routeArrow(.left) }
+        handlers.onArrowRight = { [weak self] in self?.routeArrow(.right) }
+        handlers.onArrowUp = { [weak self] in self?.routeArrow(.up) }
+        handlers.onArrowDown = { [weak self] in self?.routeArrow(.down) }
+        handlers.onTab = { [weak self] shifted in
+            guard let self, self.acceptsPanelInput else { return }
+            self.handleTab(shiftedBy: shifted)
+        }
+        handlers.onActivate = { [weak self] in
+            guard let self, self.acceptsPanelInput else { return }
+            self.activateFocusedItem()
+        }
         handlers.onPrintableKey = { [weak self] characters in
-            self?.handleTypeToSearch(characters)
+            guard let self, self.acceptsPanelInput else { return }
+            self.handleTypeToSearch(characters)
         }
         handlers.onPageScroll = { [weak self] event in
-            self?.handlePageScroll(event)
+            guard let self, self.acceptsPanelInput else { return }
+            self.handlePageScroll(event)
         }
-        // 与 handlePageScroll 的 guard 保持同一判定：这些状态下事件不参与横滑，
+        // 与 handlePageScroll 的 guard 是同一判定（模型计算属性）：这些状态下事件不参与横滑，
         // 保持方向过滤让纵向滚动（搜索结果 / 文件夹成员列表）进入内层 ScrollView。
         handlers.isPagedBrowsing = { [weak self] in
-            guard let self else { return false }
-            return self.model.settings.browsingStyle == .paged
-                && self.model.searchQuery.isEmpty
-                && !self.model.isFolderViewActive
+            self?.model.isPagedBrowsingActive ?? false
         }
+    }
+
+    /// 面板是否接受键盘 / 滚轮输入：已展开且不在收起淡出中。
+    private var acceptsPanelInput: Bool {
+        model.isVisible && !isHiding
+    }
+
+    private func routeArrow(_ direction: GridFocusNavigator.Direction) {
+        guard acceptsPanelInput else { return }
+        handleArrow(direction)
     }
 
     /// Esc 分层：组字中交给输入法；搜索词非空先清空搜索词；否则按空白点击语义
@@ -1074,7 +1159,7 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
             case .up:
                 model.searchSelectedIndex = min(max(model.searchSelectedIndex - 1, 0), hits.count - 1)
             case .down:
-                model.searchSelectedIndex = min(model.searchSelectedIndex + 1, hits.count - 1)
+                model.searchSelectedIndex = min(max(model.searchSelectedIndex, 0) + 1, hits.count - 1)
             case .left, .right, .next, .previous:
                 break
             }
@@ -1087,9 +1172,9 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
             return
         }
         // 无焦点：↑↓ 不做事，←→ 仍是翻页（分页模式、且落位动画未结束不翻页）
+        // （落位 / 跟手期间的防重入由模型翻页入口把关）
         guard direction == .left || direction == .right,
-              model.settings.browsingStyle == .paged,
-              PageSettleGuard.allowsNavigation(isSettlingPageDrag: model.isSettlingPageDrag) else { return }
+              model.settings.browsingStyle == .paged else { return }
         if direction == .left {
             model.previousPage()
         } else {
@@ -1139,7 +1224,8 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
         guard model.settings.browsingStyle == .paged,
               !model.isFolderViewActive,
               model.searchQuery.isEmpty,
-              PageSettleGuard.allowsNavigation(isSettlingPageDrag: model.isSettlingPageDrag) else { return true }
+              // 先于改焦点判断：goToPage 自己也会拦，但那时焦点已经落到目标页了
+              model.allowsPageNavigation else { return true }
         let target = model.currentPage + (forward ? 1 : -1)
         guard target >= 0, target < model.pageCount else { return true }
         let pages = model.layout.pages
@@ -1156,7 +1242,7 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
         if !model.searchQuery.isEmpty {
             let hits = model.searchHits
             guard !hits.isEmpty else { return }
-            let index = model.clampedSearchSelectedIndex
+            let index = min(max(model.searchSelectedIndex, 0), hits.count - 1)
             model.launch(appID: hits[index].appID)
             return
         }
@@ -1186,9 +1272,7 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
 
     /// 横滑事件入口：写入跟手偏移；松手/离散事件返回落位动作。
     private func handlePageScroll(_ event: PageScrollEvent) {
-        guard model.settings.browsingStyle == .paged,
-              model.searchQuery.isEmpty,
-              !model.isFolderViewActive else { return }
+        guard model.isPagedBrowsingActive else { return }
         // 落位动画期间：离散滚轮与惯性事件照旧不参与（等落位收尾）；
         // 新手势开始则按动画曲线解析表现值无缝接管跟手（消除落位期输入死窗）
         var resumingFrom: CGFloat?
@@ -1207,7 +1291,9 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
             canGoForward: model.currentPage < model.pageCount - 1,
             pageWidth: model.pageWidth,
             at: Date(),
-            resumingFrom: resumingFrom
+            resumingFrom: resumingFrom,
+            isCancelled: event.isCancelled,
+            isMayBegin: event.isMayBegin
         )
         switch action {
         case .ignored:
@@ -1222,18 +1308,37 @@ public final class LaunchpadWindowController: NSObject, NSWindowDelegate {
         }
     }
 
+    /// 横滑空闲兜底时长：.ended 正常都会送达，取较长的 0.6s 以免打断「按住手指停顿」中的手势。
+    static let pageIdleSettleDelay: TimeInterval = 0.6
+
     /// 兜底：异常收不到 .ended（手势被系统打断等）时按当前进度落位。
-    /// .ended 正常都会送达，取较长的 0.6s 以免打断"按住手指停顿"中的手势。
+    ///
+    /// 只保留一个挂起的计时器：跟手事件在 120Hz 下每帧都会到达，之前每个事件都新建
+    /// 并取消一个 DispatchWorkItem。现在计时器到期时按最近采样时刻判断是否真的空闲，
+    /// 还没空闲就按剩余时间重新挂起——语义仍是「最后一个事件之后 0.6s」。
     private func schedulePageIdleSettle() {
-        cancelPageIdleSettle()
+        guard pageIdleSettleWork == nil else { return }
+        armPageIdleSettle(after: Self.pageIdleSettleDelay)
+    }
+
+    private func armPageIdleSettle(after delay: TimeInterval) {
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            let action = pageGesture.timeoutSettle(pageWidth: model.pageWidth, at: Date())
-            guard case let .settle(direction) = action else { return }
-            model.settlePageDrag(commitDirection: direction)
+            self.pageIdleSettleWork = nil
+            let now = Date()
+            let action = self.pageGesture.timeoutSettle(
+                pageWidth: self.model.pageWidth, at: now, idle: Self.pageIdleSettleDelay
+            )
+            if case let .settle(direction) = action {
+                self.model.settlePageDrag(commitDirection: direction)
+                return
+            }
+            guard self.pageGesture.isTracking else { return }
+            let idle = now.timeIntervalSince(self.pageGesture.lastSampleDate)
+            self.armPageIdleSettle(after: max(Self.pageIdleSettleDelay - idle, 0.02))
         }
         pageIdleSettleWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     private func cancelPageIdleSettle() {

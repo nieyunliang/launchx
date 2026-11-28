@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import Testing
 @testable import LaunchXCore
+import LaunchXTestSupport
 
 // MARK: - 删除结果校验（P0-2：空字典不等于成功）
 

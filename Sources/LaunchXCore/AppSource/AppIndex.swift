@@ -15,10 +15,15 @@ public enum AppIndex {
     public struct ScanDiagnostics: Sendable, Equatable {
         public var records: [AppRecord]
         public var failedDirectories: [URL]
+        /// 存在但读不到 / 解析不了 `Contents/Info.plist` 的 .app 目录——典型是拖拽 / cp
+        /// 安装或覆盖更新仍在拷贝中。这类 bundle 内部的后续写入不会触发来源目录的
+        /// kqueue 事件，调用方需要自行稍后重扫；同时它们不应被判为「已卸载」。
+        public var incompleteBundles: [URL]
 
-        public init(records: [AppRecord], failedDirectories: [URL]) {
+        public init(records: [AppRecord], failedDirectories: [URL], incompleteBundles: [URL] = []) {
             self.records = records
             self.failedDirectories = failedDirectories
+            self.incompleteBundles = incompleteBundles
         }
     }
 
@@ -51,6 +56,7 @@ public enum AppIndex {
         var seen = Set<String>()
         var records: [AppRecord] = []
         var failedDirectories: [URL] = []
+        var incompleteBundles: [URL] = []
         for spec in specs {
             scanDirectory(
                 spec.url,
@@ -60,10 +66,15 @@ public enum AppIndex {
                 now: now,
                 seen: &seen,
                 records: &records,
-                failedDirectories: &failedDirectories
+                failedDirectories: &failedDirectories,
+                incompleteBundles: &incompleteBundles
             )
         }
-        return ScanDiagnostics(records: records, failedDirectories: failedDirectories)
+        return ScanDiagnostics(
+            records: records,
+            failedDirectories: failedDirectories,
+            incompleteBundles: incompleteBundles
+        )
     }
 
     /// 兼容入口：目录列表全部按非递归扫描。
@@ -93,7 +104,8 @@ public enum AppIndex {
         now: Date,
         seen: inout Set<String>,
         records: inout [AppRecord],
-        failedDirectories: inout [URL]
+        failedDirectories: inout [URL],
+        incompleteBundles: inout [URL]
     ) {
         // 不用 .skipsHiddenFiles：/Applications/Safari.app 是系统放置的带 UF_HIDDEN
         // 标志的符号链接（Launchpad 同样展示它），跳过隐藏会把 Safari 漏掉；
@@ -119,6 +131,9 @@ public enum AppIndex {
                 let record: AppRecord?
                 if isDirectory.boolValue {
                     record = parseAppBundle(at: url, fileManager: fileManager, now: now)
+                    if record == nil, !isWrappediOSApp(at: url, fileManager: fileManager) {
+                        incompleteBundles.append(url)
+                    }
                 } else {
                     // 替身文件：保留原名，启动交给 Finder 解析目标
                     record = parseAliasFile(at: url, now: now)
@@ -139,7 +154,8 @@ public enum AppIndex {
                     now: now,
                     seen: &seen,
                     records: &records,
-                    failedDirectories: &failedDirectories
+                    failedDirectories: &failedDirectories,
+                    incompleteBundles: &incompleteBundles
                 )
             }
         }
@@ -259,12 +275,23 @@ public enum AppIndex {
 
     // MARK: - 内部
 
-    private static func parseAppBundle(at url: URL, fileManager: FileManager, now: Date) -> AppRecord? {
+    /// 读取 bundle 的 `Contents/Info.plist`；缺失或解析不了返回 nil（安装 / 覆盖中或已损坏）。
+    static func readInfoPlist(bundleAt url: URL, fileManager: FileManager = .default) -> [String: Any]? {
         let infoURL = url.appendingPathComponent("Contents").appendingPathComponent("Info.plist")
-        guard let data = fileManager.contents(atPath: infoURL.path),
-              let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else {
-            return nil
-        }
+        guard let data = fileManager.contents(atPath: infoURL.path) else { return nil }
+        return try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any]
+    }
+
+    /// Apple Silicon 上安装的 iOS 应用：外层 `Foo.app` 只有 `Wrapper/` 与 `WrappedBundle`，
+    /// 没有 `Contents/Info.plist`。这是稳定结构而不是安装中的半成品，不能记作未完成 bundle，
+    /// 否则每次启动都会白跑一轮补扫探测，最后还要整仓重扫一次。
+    static func isWrappediOSApp(at url: URL, fileManager: FileManager = .default) -> Bool {
+        fileManager.fileExists(atPath: url.appendingPathComponent("WrappedBundle").path)
+            || fileManager.fileExists(atPath: url.appendingPathComponent("Wrapper").path)
+    }
+
+    private static func parseAppBundle(at url: URL, fileManager: FileManager, now: Date) -> AppRecord? {
+        guard let plist = readInfoPlist(bundleAt: url, fileManager: fileManager) else { return nil }
         let bundleId = plist["CFBundleIdentifier"] as? String
         let name = resolvedName(infoPlist: plist, bundle: Bundle(path: url.path), bundlePath: url.path)
         return AppRecord(
@@ -320,7 +347,8 @@ public enum SyncEngine {
     /// 合并扫描结果。`capacityPerPage` 由当前网格密度决定。
     ///
     /// - Parameter unreadablePrefixes: 本次扫描中**整体读取失败**的来源目录路径
-    ///   （外置卷未挂载 / TCC 拒绝 / 安装器正在替换 bundle）。落在这些目录下的应用
+    ///   （外置卷未挂载 / TCC 拒绝 / 安装器正在替换 bundle），以及 Info.plist 暂缺、
+    ///   仍在补扫期内的单个 .app 路径（覆盖更新中）。落在这些路径下的应用
     ///   只是「暂时扫不到」，不参与消失判定，也不累加缺失次数，避免用户的排列被误删。
     @discardableResult
     public static func merge(

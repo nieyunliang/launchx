@@ -75,7 +75,13 @@ public final class LayoutStore {
     private static let logger = Logger(subsystem: "dev.yunliang.launchx", category: "LayoutStore")
 
     /// 全部持久化数据。
-    public private(set) var state: PersistState
+    public private(set) var state: PersistState {
+        didSet { revision &+= 1 }
+    }
+
+    /// 状态修订号：`state` 每次变更 +1。派生数据（如搜索命中）据此判断缓存是否失效，
+    /// 不必逐次比较整份布局。不参与观察——读方另行读取 `state` 登记依赖。
+    @ObservationIgnored public private(set) var revision = 0
 
     /// 读取时是否发生过「整份损坏 → 隔离重建」。UI 据此提示用户（而不是静默丢弃布局）。
     public private(set) var didRecoverFromCorruption = false
@@ -167,6 +173,25 @@ public final class LayoutStore {
     }
 
     // MARK: - 变更入口
+
+    /// 合并落盘的嵌套深度；> 0 时 `persist()` 只记脏，最外层结束时统一写一次。
+    @ObservationIgnored private var batchDepth = 0
+    @ObservationIgnored private var batchDirty = false
+
+    /// 把一组连续变更合并成一次落盘（仍是同步写，只是不再逐步写）。
+    ///
+    /// 每次 `persist()` 都要在主线程做一次 JSON 编码、备份与原子写入；
+    /// 重扫（merge + 排序）、取消隐藏（隐藏态 + 补摆 + 排序）、启动（记录 + 排序）
+    /// 这类多步变更原本各写 2~3 次。可嵌套；结束时没有变更则不写。
+    public func batchUpdates(_ body: () -> Void) {
+        batchDepth += 1
+        body()
+        batchDepth -= 1
+        if batchDepth == 0, batchDirty {
+            batchDirty = false
+            persist()
+        }
+    }
 
     /// 修改布局（快照替换），落盘。
     public func updateLayout(_ mutate: (inout LayoutSnapshot) -> Void) {
@@ -298,6 +323,10 @@ public final class LayoutStore {
     }
 
     private func persist() {
+        if batchDepth > 0 {
+            batchDirty = true
+            return
+        }
         guard !isReadOnlyForFutureVersion else {
             Self.logger.notice("只读模式（更高版本的 store.json），跳过自动落盘")
             return

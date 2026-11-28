@@ -92,6 +92,35 @@ enum GridFocusNavigator {
     }
 }
 
+/// 网格周边固定元素的尺寸（搜索区、页码区）。
+///
+/// 视图排布与 `updateMetrics` 的网格高度预算共用这一份常量：之前预算里写死
+/// 底部 72pt，而页码区实际占 80pt，小窗口下最后一行的名称会被裁掉。
+enum LaunchpadChrome {
+    static let searchTopPadding: CGFloat = 62
+    static let searchBarHeight: CGFloat = 40
+    static let searchBottomPadding: CGFloat = 26
+    /// 网格首行与搜索区之间的顶部留白（PageGridView）。
+    static let gridTopPadding: CGFloat = 44
+    /// 页码点命中区边长（视觉圆点 7/9pt，命中区放大，见 PageIndicatorView）。
+    static let pageDotHitSize: CGFloat = 24
+    static let pageIndicatorPadding: CGFloat = 8
+    static let pageIndicatorBottomPadding: CGFloat = 40
+    /// 选中状态栏距底边。状态栏浮在页码区下方的留白里，不占网格高度
+    /// （否则一选中网格可用高度就少约 45pt，最后一行被裁）。
+    static let selectionBarBottomPadding: CGFloat = 6
+
+    /// 页码区总高：命中区 + 上下 padding + 底部留白。
+    static var pageIndicatorHeight: CGFloat {
+        pageDotHitSize + pageIndicatorPadding * 2 + pageIndicatorBottomPadding
+    }
+
+    /// 网格以外的纵向固定占用（网格可用高度 = 内容总高 − 此值）。
+    static var gridVerticalReserve: CGFloat {
+        searchTopPadding + searchBarHeight + searchBottomPadding + gridTopPadding + pageIndicatorHeight
+    }
+}
+
 /// Launchpad 主内容视图（全屏覆盖层根视图）。
 public struct LaunchpadContentView: View {
     // 根视图直接持有 model；不可在此声明 @Environment(LaunchpadModel.self)——
@@ -110,6 +139,7 @@ public struct LaunchpadContentView: View {
     @FocusState private var searchFocused: Bool
     /// 系统「减弱动态效果」；开启时去掉内容缩放与弹簧（P3-3）。
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var colorScheme
 
     public init(
         model: LaunchpadModel,
@@ -163,7 +193,7 @@ public struct LaunchpadContentView: View {
                 // 仅在无壁纸时启用全屏实时毛玻璃；壁纸已预模糊，无需叠加两套模糊。
                 VisualEffectBlur(material: material)
                 Color.black.opacity(0.18)
-                LXColors.glassTint(LXColors.isDark)
+                LXColors.glassTint(colorScheme == .dark)
             } else {
                 // 材质「关闭」：不创建 NSVisualEffectView（纯色叠层，与「薄」有可见区别）
                 Color.black.opacity(0.62)
@@ -178,8 +208,8 @@ public struct LaunchpadContentView: View {
         GeometryReader { geo in
             VStack(spacing: 0) {
                 searchBar
-                    .padding(.top, 62)
-                    .padding(.bottom, 26)
+                    .padding(.top, LaunchpadChrome.searchTopPadding)
+                    .padding(.bottom, LaunchpadChrome.searchBottomPadding)
 
                 if !model.searchQuery.isEmpty {
                     SearchResultsGrid()
@@ -200,17 +230,18 @@ public struct LaunchpadContentView: View {
 
                 if model.settings.browsingStyle == .paged, model.searchQuery.isEmpty, !model.isFolderViewActive {
                     PageIndicatorView()
-                        .padding(.bottom, 40)
-                }
-
-                if !model.selectedAppIDs.isEmpty {
-                    SelectionStatusBar()
-                        .padding(.bottom, 12)
+                        .padding(.bottom, LaunchpadChrome.pageIndicatorBottomPadding)
                 }
 
                 Spacer(minLength: 0)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .overlay(alignment: .bottom) {
+                if !model.selectedAppIDs.isEmpty {
+                    SelectionStatusBar()
+                        .padding(.bottom, LaunchpadChrome.selectionBarBottomPadding)
+                }
+            }
             .onPreferenceChange(ItemFramePreferenceKey.self) { frames in
                 itemFrames = frames
             }
@@ -257,12 +288,12 @@ public struct LaunchpadContentView: View {
         }
     }
 
-    /// 网格可用高度 = 总高 − 搜索区（62+40+26）− 网格顶 padding（44）− 底部页码区（~72）。
+    /// 网格可用高度 = 总高 − 搜索区 − 网格顶 padding − 底部页码区（见 `LaunchpadChrome`）。
     /// 自然尺寸由密度决定；此处只提供可用区域供小屏收缩（只缩不放）。
     private func updateMetrics(in size: CGSize) {
         contentSize = size
         var gridArea = size
-        gridArea.height -= 62 + 40 + 26 + 44 + 72
+        gridArea.height -= LaunchpadChrome.gridVerticalReserve
         let metrics = GridMetrics.compute(areaSize: gridArea, density: model.density)
         if metrics != gridMetrics { gridMetrics = metrics }
     }
@@ -329,10 +360,11 @@ public struct LaunchpadContentView: View {
                         .foregroundStyle(.white.opacity(0.45))
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("清除搜索")
             }
         }
         .padding(.horizontal, 16)
-        .frame(width: Self.searchCapsuleWidth, height: 40)
+        .frame(width: Self.searchCapsuleWidth, height: LaunchpadChrome.searchBarHeight)
         .contentShape(Rectangle())
         // 消费胶囊整体点击，避免点放大镜/胶囊留白被根级手势误判为空白而收起
         .onTapGesture { }
@@ -370,6 +402,7 @@ public struct LaunchpadContentView: View {
 struct PagedGridArea: View {
     @Environment(LaunchpadModel.self) private var model
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var colorScheme
     @Binding var itemFrames: [String: CGRect]
     @Binding var marqueeStart: CGPoint?
     let gridFocus: GridKeyboardFocus
@@ -426,10 +459,7 @@ struct PagedGridArea: View {
             .gesture(marqueeGesture(in: proxy))
             .onDrop(of: [DragPayload.type], delegate: PageBackgroundDropDelegate(model: model, pageIndex: model.currentPage))
             .onMoveCommand { direction in
-                // 横滑落位动画未结束时翻页会与 finishDragCommit 叠加成「跳两页」（P2-13）
-                guard PageSettleGuard.allowsNavigation(
-                    isSettlingPageDrag: model.isSettlingPageDrag
-                ) else { return }
+                // 落位 / 跟手期间的防重入（P2-13「跳两页」）由模型翻页入口统一把关
                 switch direction {
                 case .left: model.previousPage()
                 case .right: model.nextPage()
@@ -452,10 +482,10 @@ struct PagedGridArea: View {
     @ViewBuilder private func marqueeOverlay(in proxy: GeometryProxy) -> some View {
         if let rect = model.marqueeRect {
             Rectangle()
-                .fill(LXColors.selection(LXColors.isDark).opacity(0.12))
+                .fill(LXColors.selection(colorScheme == .dark).opacity(0.12))
                 .overlay(
                     Rectangle()
-                        .strokeBorder(LXColors.selection(LXColors.isDark), lineWidth: 1.5)
+                        .strokeBorder(LXColors.selection(colorScheme == .dark), lineWidth: 1.5)
                 )
                 .frame(width: max(rect.width, 1), height: max(rect.height, 1))
                 .position(x: rect.midX, y: rect.midY)
@@ -547,12 +577,18 @@ struct PageGridView: View {
                 let rows: [[SlotItem]] = stride(from: 0, to: items.count, by: columnCount).map {
                     Array(items[$0..<min($0 + columnCount, items.count)])
                 }
+                // 选中 / 悬停目标在这里取一次、按值传给格子：格子不直接读这两个
+                // 高频变化的集合，框选逐帧 / 换悬停目标时只有状态真变了的格子重算 body。
+                let selected = model.selectedAppIDs
+                let hover = model.hoverTarget
                 VStack(alignment: .center, spacing: metrics.gridSpacing) {
                     ForEach(rows.indices, id: \.self) { rowIndex in
                         HStack(alignment: .center, spacing: metrics.columnSpacing) {
-                            ForEach(rows[rowIndex].indices, id: \.self) { columnIndex in
+                            // 格子身份跟随条目（appID / folderID），不跟格位下标：
+                            // 否则拖放 / 隐藏 / 删除后 @State（弹簧、悬停）留在格位上落到别的条目身上
+                            ForEach(Array(rows[rowIndex].enumerated()), id: \.element.stableID) { columnIndex, item in
                                 let slotIndex = rowIndex * columnCount + columnIndex
-                                switch rows[rowIndex][columnIndex] {
+                                switch item {
                                 case let .app(appID):
                                     if let app = model.layout.apps[appID] {
                                         AppCell(
@@ -560,17 +596,21 @@ struct PageGridView: View {
                                             pageIndex: pageIndex,
                                             folderID: nil,
                                             isSearchResult: false,
-                                            isKeyboardFocused: focusedSlot == slotIndex
+                                            isKeyboardFocused: focusedSlot == slotIndex,
+                                            isSelected: selected.contains(appID),
+                                            isDropHighlighted: hover == .onApp(page: pageIndex, appID: appID)
                                         )
                                         .frame(width: metrics.cellWidth)
-                                        .id(slotIndex)
                                     }
                                 case let .folder(folder):
                                     // FolderCell 由 panel 组维护，焦点环在容器侧叠加（P3-4）
-                                    FolderCell(folder: folder, pageIndex: pageIndex)
+                                    FolderCell(
+                                        folder: folder,
+                                        pageIndex: pageIndex,
+                                        isDropHighlighted: hover == .onFolder(page: pageIndex, folderID: folder.id)
+                                    )
                                         .overlay { folderFocusRing(slotIndex: slotIndex) }
                                         .frame(width: metrics.cellWidth)
-                                        .id(slotIndex)
                                 }
                             }
                         }
@@ -586,7 +626,7 @@ struct PageGridView: View {
                     alignment: .topLeading
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-                .padding(.top, 44)
+                .padding(.top, LaunchpadChrome.gridTopPadding)
             } else {
                 EmptyStateView(systemImage: model.isScanning ? "hourglass" : "square.grid.3x3",
                                title: model.isScanning ? "正在扫描应用…" : "这一页是空的")
@@ -704,18 +744,17 @@ struct PageIndicatorView: View {
                            height: index == model.currentPage ? 9 : 7)
                     // 视觉圆点保持 7/9pt，命中区扩到 24×24：7pt 圆几乎点不中，
                     // 点偏一点就落到根级 onTapGesture 把面板收起（P2-20）。
-                    .frame(width: 24, height: 24)
+                    .frame(width: LaunchpadChrome.pageDotHitSize, height: LaunchpadChrome.pageDotHitSize)
                     .contentShape(Rectangle())
-                    .onTapGesture {
-                        // 落位动画未结束时翻页会让 finishDragCommit 再提交一次（P2-13）
-                        guard PageSettleGuard.allowsNavigation(
-                            isSettlingPageDrag: model.isSettlingPageDrag
-                        ) else { return }
-                        model.goToPage(index)
-                    }
+                    // 落位 / 跟手期间的防重入（P2-13）由 goToPage 统一把关
+                    .onTapGesture { model.goToPage(index) }
+                    .accessibilityElement()
+                    .accessibilityLabel("第 \(index + 1) 页，共 \(model.pageCount) 页")
+                    .accessibilityAddTraits(index == model.currentPage ? [.isButton, .isSelected] : .isButton)
+                    .accessibilityAction { model.goToPage(index) }
             }
         }
-        .padding(8)
+        .padding(LaunchpadChrome.pageIndicatorPadding)
         .contentShape(Rectangle())
         // 点圆点之间的留白落在容器上：显式消费，避免冒泡到根级手势收起面板。
         .onTapGesture { }
@@ -735,19 +774,23 @@ struct SearchResultsGrid: View {
     }
 
     var body: some View {
+        // 命中与高亮下标各取一次：之前每个可见格的 overlay 都经
+        // clampedSearchSelectedIndex 再算一遍完整搜索。
+        let hitIDs = model.searchResultAppIDs
+        let selectedIndex = min(max(model.searchSelectedIndex, 0), max(hitIDs.count - 1, 0))
         ScrollView {
-            if model.searchHits.isEmpty {
+            if hitIDs.isEmpty {
                 EmptyStateView(systemImage: "sparkle.magnifyingglass",
                                title: "没有找到匹配的应用",
                                subtitle: "只搜索应用名称")
                     .frame(minHeight: 320)
             } else {
                 LazyVGrid(columns: columns, spacing: metrics.gridSpacing) {
-                    ForEach(Array(model.searchResultAppIDs.enumerated()), id: \.element) { index, appID in
+                    ForEach(Array(hitIDs.enumerated()), id: \.element) { index, appID in
                         if let app = model.layout.apps[appID] {
                             AppCell(app: app, pageIndex: 0, folderID: nil, isSearchResult: true)
                                 .overlay(alignment: .topLeading) {
-                                    if index == model.clampedSearchSelectedIndex {
+                                    if index == selectedIndex {
                                         RoundedRectangle(cornerRadius: 12)
                                             .strokeBorder(LXColors.accent, lineWidth: 2)
                                             .padding(-4)

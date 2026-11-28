@@ -185,4 +185,42 @@ struct InteractivePageGestureTests {
                             pageWidth: width, at: at(0.05))
         #expect(action == .settle(1))  // 速度判定仍成立（进度仅 0.08）
     }
+
+    // MARK: 评审 P2：.cancelled / .mayBegin / 空闲兜底
+
+    /// 系统取消手势：跟手中立即回弹，不再等 0.6s idle 兜底（页面停在半截）。
+    @Test func cancelledPhaseSettlesBackImmediately() {
+        var g = InteractivePageGesture()
+        slow(&g, deltas: [-200, -200], started: true)  // 进度 0.4，按进度本该提交
+        let action = g.feed(delta: 0, isGestureStart: false, isEnded: false, isMomentum: false,
+                            isDiscrete: false, canGoBackward: true, canGoForward: true,
+                            pageWidth: width, at: at(0.6), isCancelled: true)
+        #expect(action == .settle(0))
+        #expect(!g.isTracking)
+        // 已落位后再来的取消事件不再产生动作
+        let again = g.feed(delta: 0, isGestureStart: false, isEnded: false, isMomentum: false,
+                           isDiscrete: false, canGoBackward: true, canGoForward: true,
+                           pageWidth: width, at: at(0.7), isCancelled: true)
+        #expect(again == .ignored)
+    }
+
+    /// 手指放上未动（.mayBegin）不算手势开始：不进入跟手。
+    @Test func mayBeginPhaseIsIgnored() {
+        var g = InteractivePageGesture()
+        let action = g.feed(delta: 0, isGestureStart: false, isEnded: false, isMomentum: false,
+                            isDiscrete: false, canGoBackward: true, canGoForward: true,
+                            pageWidth: width, at: at(0), isMayBegin: true)
+        #expect(action == .ignored)
+        #expect(!g.isTracking)
+    }
+
+    /// 空闲兜底按调用方给的时长判定（窗口层用 0.6s）：未到时长不落位。
+    @Test func timeoutSettleHonorsIdleDuration() {
+        var g = InteractivePageGesture()
+        slow(&g, deltas: [-300], started: true)  // 最近采样在 0.25s
+        #expect(g.isTracking)
+        #expect(g.lastSampleDate == at(0.25))
+        #expect(g.timeoutSettle(pageWidth: width, at: at(0.65), idle: 0.6) == .ignored)
+        #expect(g.timeoutSettle(pageWidth: width, at: at(0.9), idle: 0.6) == .settle(1))
+    }
 }

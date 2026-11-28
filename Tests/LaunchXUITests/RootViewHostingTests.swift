@@ -306,8 +306,11 @@ struct Wave2InteractionRegressionTests {
     // MARK: P2-13 落位动画期间翻页入口让路
 
     @Test func pageNavigationWaitsForSettle() {
-        #expect(PageSettleGuard.allowsNavigation(isSettlingPageDrag: false))
-        #expect(!PageSettleGuard.allowsNavigation(isSettlingPageDrag: true))
+        #expect(PageSettleGuard.allowsNavigation(isSettlingPageDrag: false, pageDragOffset: 0))
+        #expect(!PageSettleGuard.allowsNavigation(isSettlingPageDrag: true, pageDragOffset: 0))
+        // 手指仍在跟手（偏移非零）：方向键 / 页码点同样让路，否则松手后再提交一次 → 跳两页
+        #expect(!PageSettleGuard.allowsNavigation(isSettlingPageDrag: false, pageDragOffset: -120))
+        #expect(!PageSettleGuard.allowsNavigation(isSettlingPageDrag: false, pageDragOffset: 40))
     }
 
     // MARK: P2-16 壁纸捕获兜底

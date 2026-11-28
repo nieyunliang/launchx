@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import Testing
 @testable import LaunchXCore
+import LaunchXTestSupport
 
 // MARK: - 2026-11-14 第 3 轮审查缺陷的回归测试
 

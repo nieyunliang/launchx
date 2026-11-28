@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import Testing
 @testable import LaunchXCore
+import LaunchXTestSupport
 
 // MARK: - 2026-11-14 复查缺陷的回归测试（F1–F12）
 
@@ -509,5 +510,106 @@ struct BugFixRegressionTests {
         #expect(AppDelegate.shouldShowPanelOnColdLaunch(
             onboardingCompleted: true, isSmokeMode: false,
             loginItemEnabled: true, secondsSinceLogin: nil))
+    }
+
+    // MARK: 安装中的 .app（Info.plist 尚未写入）
+
+    @Test func scanReportsIncompleteBundleAndPicksItUpOnceComplete() throws {
+        let dir = tempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        // 拖拽 / cp 安装：bundle 目录先出现，Contents/Info.plist 稍后才写入
+        let contents = dir.appendingPathComponent("Fresh.app/Contents", isDirectory: true)
+        try FileManager.default.createDirectory(at: contents, withIntermediateDirectories: true)
+
+        let first = AppIndex.scanWithDiagnostics(directories: [dir])
+        #expect(first.records.isEmpty)
+        #expect(first.incompleteBundles.map(\.lastPathComponent) == ["Fresh.app"])
+        #expect(first.failedDirectories.isEmpty)
+
+        let plist: [String: Any] = ["CFBundleIdentifier": "com.example.fresh", "CFBundleName": "Fresh"]
+        try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            .write(to: contents.appendingPathComponent("Info.plist"))
+
+        let second = AppIndex.scanWithDiagnostics(directories: [dir])
+        #expect(second.records.map(\.id) == ["com.example.fresh"])
+        #expect(second.incompleteBundles.isEmpty)
+    }
+
+    @Test func wrappediOSAppIsNotReportedAsIncompleteBundle() throws {
+        let dir = tempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        // Apple Silicon 上的 iOS 应用：外层只有 Wrapper/ 与 WrappedBundle 链接，没有 Contents/
+        let app = dir.appendingPathComponent("Phone.app", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: app.appendingPathComponent("Wrapper", isDirectory: true), withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: app.appendingPathComponent("WrappedBundle"), withDestinationURL: URL(fileURLWithPath: "Wrapper/Phone.app"))
+
+        let result = AppIndex.scanWithDiagnostics(directories: [dir])
+        #expect(result.incompleteBundles.isEmpty)
+    }
+
+    @Test func bundleBeingOverwrittenIsNotCountedAsMissing() {
+        var app = makeApp("a")
+        app.path = "/Applications/A.app"
+        var layout = LayoutSnapshot()
+        layout.apps["a"] = app
+        layout.pages = [PageRecord(items: [.app(id: "a")])]
+
+        // 覆盖更新期间 Info.plist 暂缺：扫描把该 bundle 报为未完成，合并时视同暂时不可读
+        for _ in 0..<3 {
+            let result = SyncEngine.merge(
+                scanned: [],
+                into: &layout,
+                capacityPerPage: 35,
+                unreadablePrefixes: ["/Applications/A.app"]
+            )
+            #expect(result.removedAppIDs.isEmpty)
+        }
+        #expect(layout.apps["a"]?.missingScans == 0)
+        #expect(layout.placedAppIDs == ["a"])
+    }
+
+    @Test func incompleteBundleRetryKeepsPendingProbeAcrossUnrelatedScans() {
+        var retry = IncompleteBundleRetry()
+        #expect(retry.scanCompleted(incomplete: ["/A/X.app"]) == .arm(IncompleteBundleRetry.delays[0]))
+        _ = retry.probeFailed()
+        // 无关重扫报告同一批未完成 bundle：不重置、不消耗次数
+        #expect(retry.scanCompleted(incomplete: ["/A/X.app"]) == .keep)
+        #expect(retry.attempt == 1)
+        // 集合变化（新装了另一个应用）重新计数
+        #expect(retry.scanCompleted(incomplete: ["/A/X.app", "/A/Y.app"]) == .arm(IncompleteBundleRetry.delays[0]))
+        #expect(retry.attempt == 0)
+        #expect(retry.scanCompleted(incomplete: []) == .cancel)
+        #expect(retry.pending.isEmpty)
+    }
+
+    @Test func exhaustedIncompleteBundleStopsProbingButKeepsArrangement() {
+        var retry = IncompleteBundleRetry()
+        _ = retry.scanCompleted(incomplete: ["/Applications/A.app"])
+        for _ in 1..<IncompleteBundleRetry.delays.count { #expect(retry.probeFailed() != nil) }
+        #expect(retry.probeFailed() == nil)
+        // 已放弃的不再排探测
+        #expect(retry.scanCompleted(incomplete: ["/Applications/A.app"]) == .cancel)
+
+        // 超过补扫窗口的长时间覆盖更新：合并仍把未完成 bundle 当作暂时读不到，排列不丢
+        var app = makeApp("a")
+        app.path = "/Applications/A.app"
+        var layout = LayoutSnapshot()
+        layout.apps["a"] = app
+        layout.pages = [PageRecord(items: [.app(id: "a")])]
+        var removed: [String] = []
+        for _ in 0..<3 {
+            removed += SyncEngine.merge(
+                scanned: [], into: &layout, capacityPerPage: 35,
+                unreadablePrefixes: ["/Applications/A.app"]
+            ).removedAppIDs
+        }
+        #expect(removed.isEmpty)
+        #expect(layout.placedAppIDs == ["a"])
+
+        // 恢复正常一次后清出已放弃集合：再次覆盖更新时重新排探测
+        _ = retry.scanCompleted(incomplete: [])
+        #expect(retry.scanCompleted(incomplete: ["/Applications/A.app"]) == .arm(IncompleteBundleRetry.delays[0]))
     }
 }

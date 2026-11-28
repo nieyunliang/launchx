@@ -8,8 +8,13 @@ struct FolderCell: View {
     @Environment(\.gridMetrics) private var metrics
     let folder: FolderRecord
     let pageIndex: Int
+    /// 是否是拖放「合入文件夹」的悬停目标（父视图按 `hoverTarget` 算好传入，
+    /// 格子自己读 `hoverTarget` 会让每次换悬停目标时所有格子重算）。
+    var isDropHighlighted: Bool = false
 
     @State private var hovered = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var colorScheme
 
     private let previewColumns = Array(repeating: GridItem(.flexible(), spacing: 4), count: 3)
 
@@ -33,10 +38,15 @@ struct FolderCell: View {
             }
         }
         .padding(.horizontal, 2)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("文件夹：\(folder.name)")
+        .accessibilityValue("\(folder.appIDs.count) 个应用")
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction { openFolder() }
         // 点击热区只覆盖预览+名称可见内容（手势挂在 folderPreview 与 Text 上），
         // 格子空白落回页面背景手势；右键与悬停徽章仍覆盖整格。
         .contentShape(Rectangle())
-        .contextMenu { folderMenu }
+        .contextMenu { FolderCellMenu(folder: folder, pageIndex: pageIndex) }
         .onHover { hovered = $0 }
         // 手势之后才撑满格宽：布局居中不变，热区跟随内容
         .frame(maxWidth: .infinity)
@@ -48,7 +58,6 @@ struct FolderCell: View {
             delegate: AppDropDelegate(
                 model: model,
                 pageIndex: pageIndex,
-                folderID: nil,
                 targetAppID: "",
                 isFolderTarget: true,
                 folderTargetID: folder.id
@@ -59,7 +68,7 @@ struct FolderCell: View {
     // MARK: 3×3 预览（folder.glass.cornerRadius 玻璃圆角）
 
     private var folderPreview: some View {
-        let dark = LXColors.isDark
+        let dark = colorScheme == .dark
         let apps = folder.appIDs.compactMap { model.layout.apps[$0] }
         let corner = metrics.iconSize * 0.25
         return LazyVGrid(columns: previewColumns, spacing: 4) {
@@ -77,7 +86,7 @@ struct FolderCell: View {
             tint: hovered ? LXColors.folderHighlight(dark) : LXColors.folderTint(dark)
         )
         .overlay {
-            if case let .onFolder(_, hoverFolderID) = model.hoverTarget, hoverFolderID == folder.id {
+            if isDropHighlighted {
                 RoundedRectangle(cornerRadius: corner, style: .continuous)
                     .strokeBorder(LXColors.accent, lineWidth: 2)
             }
@@ -87,19 +96,19 @@ struct FolderCell: View {
     }
 
     private func openFolder() {
-        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+        withAnimation(MotionPreference.folderOpen(reduceMotion: reduceMotion)) {
             model.openFolder(page: pageIndex, folderID: folder.id)
         }
     }
 
     @ViewBuilder private var hoverBadge: some View {
-        if model.layout.apps.values.first(where: { $0.isNew })?.isNew == true, folderContainsNew {
+        if folderContainsNew {
             Text("NEW")
                 .font(.system(size: 9, weight: .bold))
                 .foregroundStyle(.white)
                 .padding(.horizontal, 5)
                 .padding(.vertical, 1.5)
-                .background(Capsule().fill(LXColors.newBadge(LXColors.isDark)))
+                .background(Capsule().fill(LXColors.newBadge(colorScheme == .dark)))
                 .offset(x: 2, y: -2)
         }
     }
@@ -107,10 +116,15 @@ struct FolderCell: View {
     private var folderContainsNew: Bool {
         folder.appIDs.contains { model.layout.apps[$0]?.isNew == true }
     }
+}
 
-    // MARK: 文件夹右键菜单
+/// 文件夹格右键菜单（独立视图：只在 SwiftUI 需要时求值，见 `AppCellMenu`）。
+struct FolderCellMenu: View {
+    @Environment(LaunchpadModel.self) private var model
+    let folder: FolderRecord
+    let pageIndex: Int
 
-    @ViewBuilder private var folderMenu: some View {
+    var body: some View {
         Button("打开") {
             model.openFolder(page: pageIndex, folderID: folder.id)
         }
@@ -141,6 +155,7 @@ struct FolderCell: View {
 struct OpenedFolderView: View {
     @Environment(LaunchpadModel.self) private var model
     @Environment(\.gridMetrics) private var metrics
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var folder: FolderRecord? { model.openedFolderRecord }
 
@@ -162,6 +177,10 @@ struct OpenedFolderView: View {
                             FolderMemberCell(app: app, folderID: folder.id)
                         }
                     }
+                    // 成员网格范围内（含行间距）的放置不算「拖到空白处」：吞掉，不移出文件夹。
+                    // 必须挂在居中 frame 之前，只覆盖网格自然尺寸。
+                    .contentShape(Rectangle())
+                    .onDrop(of: [DragPayload.type], delegate: FolderGridGapDropDelegate(model: model))
                     // 固定格宽：网格取自然大小居中，大屏两侧自然留白
                     .frame(maxWidth: .infinity, alignment: .center)
                     .padding(.vertical, 24)
@@ -169,7 +188,7 @@ struct OpenedFolderView: View {
                 .frame(maxHeight: .infinity)
 
                 Button {
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+                    withAnimation(MotionPreference.folderClose(reduceMotion: reduceMotion)) {
                         model.closeFolder()
                     }
                 } label: {
@@ -178,6 +197,7 @@ struct OpenedFolderView: View {
                         .foregroundStyle(.white.opacity(0.75))
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("关闭文件夹")
                 .padding(.bottom, 12)
             }
         }
@@ -192,7 +212,7 @@ struct OpenedFolderView: View {
                 .padding(.horizontal, 80)
                 .padding(.vertical, 40)
         }
-        .transition(.scale(scale: 0.92).combined(with: .opacity))
+        .transition(MotionPreference.folderTransition(reduceMotion: reduceMotion))
     }
 }
 
@@ -223,12 +243,21 @@ struct FolderMemberCell: View {
                     .shadow(color: .black.opacity(0.8), radius: 1.5, y: 1)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    .frame(maxWidth: metrics.cellWidth - 4)
             }
         }
         .opacity(app.hidden ? 0.55 : 1)
+        // 铺满整格：格宽约为图标宽的 2 倍，只有图标那块接收放置的话，
+        // 同行图标之间的空隙会落到背景放置（= 移出文件夹），文件夹内重排松手偏一点就被移出。
+        .frame(width: metrics.cellWidth)
         .contentShape(Rectangle())
         .onTapGesture { model.launch(appID: app.id) }
-        .contextMenu { memberMenu }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(app.name)
+        .accessibilityValue(app.hidden ? "已隐藏" : "")
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction { model.launch(appID: app.id) }
+        .contextMenu { FolderMemberMenu(app: app) }
         .onHover { hovered = $0 }
         .onDrag {
             let sessionID = DragObserver.shared.beginDrag(ids: [app.id])
@@ -236,10 +265,14 @@ struct FolderMemberCell: View {
         }
         .onDrop(of: [DragPayload.type], delegate: FolderMemberDropDelegate(model: model, folderID: folderID, targetAppID: app.id))
     }
+}
 
-    // MARK: 右键菜单
+/// 文件夹成员右键菜单（独立视图，见 `AppCellMenu`）。
+struct FolderMemberMenu: View {
+    @Environment(LaunchpadModel.self) private var model
+    let app: AppRecord
 
-    @ViewBuilder private var memberMenu: some View {
+    var body: some View {
         Button("打开") { model.launch(appID: app.id) }
         Button("在访达中显示") { model.openInFinder(appID: app.id) }
         Button("显示简介") { model.showGetInfo(appID: app.id) }
@@ -277,6 +310,27 @@ struct FolderMemberDropDelegate: DropDelegate {
             DragObserver.shared.endDrag(sessionID: payload.sessionID)
             guard !dragging.isEmpty, dragging != [targetAppID] else { return }
             model.moveWithinFolder(draggingIDs: dragging, folderID: folderID, beforeAppID: targetAppID)
+        }
+    }
+}
+
+/// 文件夹成员网格内、落在格子之外（行间距）的放置：不做任何移动，只结束拖拽会话。
+struct FolderGridGapDropDelegate: DropDelegate {
+    let model: LaunchpadModel
+
+    func validateDrop(info: DropInfo) -> Bool {
+        info.hasItemsConforming(to: [DragPayload.type])
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        model.hoverTarget = nil
+        return DragPayload.load(from: info) { payload in
+            guard let payload else { return }
+            DragObserver.shared.endDrag(sessionID: payload.sessionID)
         }
     }
 }

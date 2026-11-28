@@ -3,6 +3,7 @@ import Foundation
 import Observation
 import Testing
 @testable import LaunchXCore
+import LaunchXTestSupport
 
 // MARK: - Launchpad 模型
 
@@ -170,6 +171,35 @@ struct LaunchpadModelTests {
         model.performDrop(draggingIDs: ["b"], sourceFolderID: nil, target: .onFolder(page: 0, folderID: folder.id))
         #expect(store.state.layout.pages[0].items.count == 1)
         #expect(store.state.layout.pages[0].items[0].folder?.appIDs == ["a", "b"])
+    }
+
+    /// 目标在载荷回调到来前已失效（被重扫移除 / 文件夹已解散）：被拖应用不能变成不在任何页上的孤儿。
+    @Test func dropOnVanishedTargetKeepsDraggedAppPlaced() {
+        let dir = tempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = LayoutStore(directory: dir)
+        let model = LaunchpadModel(store: store)
+        store.updateSettings { $0.activeSortKey = .custom }
+        store.updateLayout { layout in
+            layout.apps["a"] = makeApp("a")
+            layout.apps["b"] = makeApp("b")
+            layout.pages = [PageRecord(items: [.app(id: "a"), .app(id: "b")])]
+        }
+
+        model.performDrop(draggingIDs: ["b"], sourceFolderID: nil, target: .onApp(page: 0, appID: "gone"))
+        #expect(store.state.layout.pageIndexOfDirectApp("b") == 0)
+
+        model.performDrop(draggingIDs: ["b"], sourceFolderID: nil, target: .onFolder(page: 0, folderID: UUID()))
+        #expect(store.state.layout.pageIndexOfDirectApp("b") == 0)
+        #expect(store.state.layout.placedAppIDs.sorted() == ["a", "b"])
+    }
+
+    /// 悬停「建夹」高亮与松手动作共用同一判定：只有单拖未选中项才建夹。
+    @Test func dropHighlightMatchesFolderCreationRule() {
+        #expect(AppDropDelegate.createsFolder(dragging: ["b"], targetAppID: "a", selectedAppIDs: []))
+        #expect(!AppDropDelegate.createsFolder(dragging: ["b"], targetAppID: "a", selectedAppIDs: ["b"]))
+        #expect(!AppDropDelegate.createsFolder(dragging: ["b", "c"], targetAppID: "a", selectedAppIDs: ["b", "c"]))
+        #expect(!AppDropDelegate.createsFolder(dragging: ["a"], targetAppID: "a", selectedAppIDs: []))
     }
 
     @Test func slotDropReordersWithSpill() {

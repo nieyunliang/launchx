@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import Testing
 @testable import LaunchXCore
+import LaunchXTestSupport
 
 // MARK: - 卸载扫描器
 

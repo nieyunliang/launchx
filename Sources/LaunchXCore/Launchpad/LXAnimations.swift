@@ -129,6 +129,21 @@ enum MotionPreference {
         return .easeOut(duration: profile.transitionDuration)
     }
 
+    /// 打开文件夹的动画；减弱动态效果时只做短淡入（不弹簧、不缩放）。
+    static func folderOpen(reduceMotion: Bool) -> Animation {
+        reduceMotion ? .easeOut(duration: reduced.transitionDuration) : .spring(response: 0.35, dampingFraction: 0.8)
+    }
+
+    /// 关闭文件夹的动画（同上）。
+    static func folderClose(reduceMotion: Bool) -> Animation {
+        reduceMotion ? .easeOut(duration: reduced.transitionDuration) : .spring(response: 0.3, dampingFraction: 0.85)
+    }
+
+    /// 文件夹面板的出入转场：常态 0.92 缩放 + 淡入淡出，减弱动态效果时只淡入淡出。
+    static func folderTransition(reduceMotion: Bool) -> AnyTransition {
+        reduceMotion ? .opacity : .scale(scale: 0.92).combined(with: .opacity)
+    }
+
     /// 翻页动画：与常态同曲线，减弱动态效果时只缩短时长。
     static func pageSlide(reduceMotion: Bool) -> Animation {
         let profile = profile(reduceMotion: reduceMotion)

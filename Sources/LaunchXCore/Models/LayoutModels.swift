@@ -147,6 +147,15 @@ public enum SlotItem: Codable, Hashable, Sendable {
     case app(id: String)
     case folder(FolderRecord)
 
+    /// 跟随条目本身的稳定身份（视图 ForEach 用）：应用 = appID，文件夹 = folder.id。
+    /// 不能用格位下标——拖放 / 隐藏 / 删除后，后续格的 @State 会留在格位上落到别的条目身上。
+    public var stableID: String {
+        switch self {
+        case let .app(id): "app:" + id
+        case let .folder(folder): "folder:" + folder.id.uuidString
+        }
+    }
+
     private struct AppSlot: Codable, Hashable { let id: String }
     private enum CodingKeys: String, CodingKey { case app, folder }
 
@@ -338,6 +347,13 @@ public struct LayoutSnapshot: Codable, Hashable, Sendable {
             if index == pages.count {
                 pages.append(PageRecord())
             }
+        }
+    }
+
+    /// 没有任何页面时补一页（resetLayout 等路径可能留下零页，后续 pages[-1] 会崩溃）。
+    public mutating func ensureHasPage() {
+        if pages.isEmpty {
+            pages = [PageRecord()]
         }
     }
 

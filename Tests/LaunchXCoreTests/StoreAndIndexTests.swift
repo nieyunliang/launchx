@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 @testable import LaunchXCore
+import LaunchXTestSupport
 
 // MARK: - 存储
 

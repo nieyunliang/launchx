@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 @testable import LaunchXCore
+import LaunchXTestSupport
 
 // MARK: - 完全磁盘访问检测（审查 findings-c F-03 回归）
 

@@ -14,7 +14,13 @@ import Testing
 ///
 /// 每个场景结束后必须 `window.contentView = nil` 拆掉 hosting 视图：
 /// 本套件 serialized 同进程串行，泄漏的窗口/视图树会污染后续场景的计时。
-@Suite(.serialized)
+///
+/// 会打开真实窗口连续翻页约 100 秒，默认不跑：需设置 `LAUNCHX_PERF=1`
+/// （`scripts/test.sh perf` 会自动设置）。
+@Suite(
+    .serialized,
+    .enabled(if: ProcessInfo.processInfo.environment["LAUNCHX_PERF"] == "1", "需 LAUNCHX_PERF=1（scripts/test.sh perf）")
+)
 @MainActor
 final class PageFlipPerformanceTests {
 

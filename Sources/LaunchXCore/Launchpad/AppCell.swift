@@ -100,9 +100,17 @@ struct AppCell: View {
     let isSearchResult: Bool
     /// 键盘导航焦点（P3-4）：仅用于显示焦点环，不改变点击/启动语义。
     var isKeyboardFocused: Bool = false
+    /// 是否在 ⌘ 多选集合里。由父视图算好按值传入：格子自己读 `selectedAppIDs`
+    /// 会让框选逐帧时所有物化页的 100 多个格子全部重算 body。
+    var isSelected: Bool = false
+    /// 是否是拖放「建文件夹」的悬停目标（父视图按 `hoverTarget` 算好传入，理由同上）。
+    var isDropHighlighted: Bool = false
     /// 点击弹簧回弹的触发计数（递增一次播放一轮）。
     @State private var springTrigger = 0
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorScheme) private var colorScheme
+
+    private var isDark: Bool { colorScheme == .dark }
 
     var body: some View {
         VStack(spacing: 7) {
@@ -126,19 +134,27 @@ struct AppCell: View {
         .background(selectionRing)
         // 键盘焦点环：与「选中」环区分（选中是填充色块，焦点是亮色描边）。
         .overlay { keyboardFocusRing }
+        // VoiceOver：整格合成一个按钮元素，激活 = 与点击同语义（启动）。
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(app.name)
+        .accessibilityValue(accessibilityStateDescription)
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+        .accessibilityAction { model.launch(appID: app.id) }
         // 点击热区只覆盖图标/名称可见内容（手势挂在 iconArea 与 Text 上），
         // 格子空白落回页面背景手势（收起选区/关文件夹）；
         // 右键菜单与拖放落点仍覆盖整格，保持宽容。
         .contentShape(Rectangle())
-        .contextMenu { menuItems }
+        // 菜单抽成独立视图：内联的菜单内容会在每次格子 body 求值时一起构建
+        // （含卸载判定的文件 I/O、运行状态查询），且只在格子重绘时才更新。
+        .contextMenu { AppCellMenu(app: app, isSearchResult: isSearchResult) }
         .modifier(
             DragSourceModifier(
                 appID: app.id,
                 isEnabled: !isSearchResult,
-                // 多选时拖选中项 = 拖全部选中（按页内视觉顺序）；拖未选中项 = 单拖自身
-                selectionIDs: isSearchResult || !model.selectedAppIDs.contains(app.id)
-                    ? []
-                    : model.orderedSelection(onPage: pageIndex)
+                // 多选时拖选中项 = 拖全部选中（按页内视觉顺序）；拖未选中项 = 单拖自身。
+                // 载荷在拖拽开始时才算，body 求值不再做 O(页内项数) 的排序。
+                selectionSource: isSearchResult || !isSelected ? nil : model,
+                pageIndex: pageIndex
             )
         )
         // 手势之后才撑满格宽：布局居中不变，热区/选中环跟随内容
@@ -150,7 +166,6 @@ struct AppCell: View {
                 delegate: AppDropDelegate(
                     model: model,
                     pageIndex: pageIndex,
-                    folderID: folderID,
                     targetAppID: app.id,
                     isFolderTarget: false,
                     folderTargetID: nil
@@ -187,7 +202,7 @@ struct AppCell: View {
             .modifier(ClickSpringEffect(trigger: springTrigger, disabled: reduceMotion))
             .overlay {
                 // 放置悬停高亮：拖到该应用上将建文件夹
-                if case let .onApp(_, hoverAppID) = model.hoverTarget, hoverAppID == app.id {
+                if isDropHighlighted {
                     RoundedRectangle(cornerRadius: metrics.cornerRadius + 2, style: .continuous)
                         .strokeBorder(LXColors.accent, lineWidth: 2)
                 }
@@ -206,7 +221,7 @@ struct AppCell: View {
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1.5)
                     .background(
-                        Capsule().fill(LXColors.newBadge(LXColors.isDark))
+                        Capsule().fill(LXColors.newBadge(isDark))
                     )
                     .shadow(color: .black.opacity(0.3), radius: 1)
             }
@@ -222,15 +237,23 @@ struct AppCell: View {
     }
 
     @ViewBuilder private var selectionRing: some View {
-        if model.selectedAppIDs.contains(app.id) {
+        if isSelected {
             RoundedRectangle(cornerRadius: metrics.cornerRadius, style: .continuous)
-                .strokeBorder(LXColors.selection(LXColors.isDark), lineWidth: 2)
+                .strokeBorder(LXColors.selection(isDark), lineWidth: 2)
                 .background(
                     RoundedRectangle(cornerRadius: metrics.cornerRadius, style: .continuous)
-                        .fill(LXColors.selection(LXColors.isDark).opacity(0.12))
+                        .fill(LXColors.selection(isDark).opacity(0.12))
                 )
                 .padding(-4)
         }
+    }
+
+    /// VoiceOver 读出的状态（新安装 / 已隐藏）。
+    private var accessibilityStateDescription: String {
+        var parts: [String] = []
+        if app.isNew, !isSearchResult { parts.append("新安装") }
+        if app.hidden { parts.append("已隐藏") }
+        return parts.joined(separator: "，")
     }
 
     // MARK: 交互
@@ -260,10 +283,18 @@ struct AppCell: View {
                 .accessibilityHidden(true)
         }
     }
+}
 
-    // MARK: 右键菜单（GAP §2.11 全量）
+// MARK: - 右键菜单（GAP §2.11 全量）
 
-    @ViewBuilder private var menuItems: some View {
+/// 应用格右键菜单。独立成视图：菜单内容只在 SwiftUI 需要它时求值，
+/// 不随格子每次 body 求值一起构建。
+struct AppCellMenu: View {
+    @Environment(LaunchpadModel.self) private var model
+    let app: AppRecord
+    let isSearchResult: Bool
+
+    var body: some View {
         Button("打开") { model.launch(appID: app.id) }
         Button("显示简介") { model.showGetInfo(appID: app.id) }
         Button("在访达中显示") { model.openInFinder(appID: app.id) }
@@ -314,17 +345,20 @@ struct AppCell: View {
 
 // MARK: - 拖拽源
 
-/// 单/多选拖拽源；`selectionIDs` 为按页内视觉顺序排好的多选载荷（空 = 单拖当前项）。
+/// 单/多选拖拽源。`selectionSource` 非 nil 时拖的是整个多选集合（按 `pageIndex`
+/// 页内视觉顺序），在拖拽开始时才取；nil = 单拖当前项。
 struct DragSourceModifier: ViewModifier {
     let appID: String
     /// 搜索结果等只读界面不挂拖拽源。
     var isEnabled = true
-    let selectionIDs: [String]
+    let selectionSource: LaunchpadModel?
+    let pageIndex: Int
 
     func body(content: Content) -> some View {
         if isEnabled {
             content.onDrag {
-                let ids = selectionIDs.isEmpty ? [appID] : selectionIDs
+                let selection = selectionSource?.orderedSelection(onPage: pageIndex) ?? []
+                let ids = selection.isEmpty ? [appID] : selection
                 // 每次拖拽开启新会话：载荷里带上会话 id，drop 时校验，旧会话的载荷会被拒绝。
                 let sessionID = DragObserver.shared.beginDrag(ids: ids)
                 return DragPayload.provider(ids, sessionID: sessionID)
@@ -409,18 +443,31 @@ final class DragObserver: @unchecked Sendable {
 struct AppDropDelegate: DropDelegate {
     let model: LaunchpadModel
     let pageIndex: Int
-    let folderID: UUID?
     let targetAppID: String
     let isFolderTarget: Bool
     let folderTargetID: UUID?
 
     func dropEntered(info: DropInfo) {
-        guard DragObserver.shared.currentIDs() != [targetAppID] else { return }
-        withAnimation(.easeInOut(duration: 0.15)) {
-            model.hoverTarget = isFolderTarget
-                ? .onFolder(page: pageIndex, folderID: folderTargetID!)
-                : .onApp(page: pageIndex, appID: targetAppID)
+        // 高亮必须与松手后的实际动作一致：只在会建夹 / 合入文件夹时显示，
+        // 插入排序（多选 / 选中项）与非自定义排序（只会弹提示）不显示建夹高亮。
+        let dragging = DragObserver.shared.currentIDs()
+        guard model.dragAllowed, !dragging.isEmpty, dragging != [targetAppID] else { return }
+        let target: DropTarget
+        if isFolderTarget {
+            guard let folderTargetID else { return }
+            target = .onFolder(page: pageIndex, folderID: folderTargetID)
+        } else {
+            guard Self.createsFolder(dragging: dragging, targetAppID: targetAppID, selectedAppIDs: model.selectedAppIDs) else { return }
+            target = .onApp(page: pageIndex, appID: targetAppID)
         }
+        withAnimation(.easeInOut(duration: 0.15)) {
+            model.hoverTarget = target
+        }
+    }
+
+    /// 拖到应用上是否建文件夹（否则插到目标之后重排）。悬停高亮与 `handleDrop` 共用此判定。
+    static func createsFolder(dragging: [String], targetAppID: String, selectedAppIDs: Set<String>) -> Bool {
+        dragging.count == 1 && dragging[0] != targetAppID && !selectedAppIDs.contains(dragging[0])
     }
 
     func dropExited(info: DropInfo) {
@@ -456,8 +503,7 @@ struct AppDropDelegate: DropDelegate {
         guard dragging != [targetAppID] else { return }
 
         // 单个非选中项拖到应用上 → 建文件夹；多选/选中项 → 插到目标之后（重排）
-        if dragging.count == 1, dragging[0] != targetAppID,
-           model.selectedAppIDs.contains(dragging[0]) == false {
+        if Self.createsFolder(dragging: dragging, targetAppID: targetAppID, selectedAppIDs: model.selectedAppIDs) {
             model.performDrop(draggingIDs: dragging, sourceFolderID: nil, target: .onApp(page: pageIndex, appID: targetAppID))
         } else {
             model.performDrop(draggingIDs: dragging, sourceFolderID: nil, target: .slot(page: pageIndex, slot: slotAfterTarget(dragging: dragging)))

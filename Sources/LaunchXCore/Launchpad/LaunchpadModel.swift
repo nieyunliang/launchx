@@ -13,6 +13,14 @@ public enum DropTarget: Equatable {
     case onApp(page: Int, appID: String)
     /// 拖到文件夹上（合并进文件夹）。
     case onFolder(page: Int, folderID: UUID)
+
+    /// 落点所在页。
+    var page: Int {
+        switch self {
+        case let .slot(page, _), let .pageBackground(page), let .onApp(page, _), let .onFolder(page, _):
+            return page
+        }
+    }
 }
 
 /// 搜索命中（含排序分数）。
@@ -108,8 +116,6 @@ public final class LaunchpadModel {
     public var selectedAppIDs: Set<String> = []
     /// 橡皮筋选框（页面坐标空间；nil = 无框选）。
     public var marqueeRect: CGRect?
-    /// 正在拖拽的应用 id（用于预览计数角标与目标高亮）。
-    public var draggingAppIDs: [String] = []
     /// 拖拽悬停目标高亮。
     public var hoverTarget: DropTarget?
     /// 面板可见性。
@@ -212,21 +218,35 @@ public final class LaunchpadModel {
 
     // MARK: - 页导航
 
+    /// 翻页入口的防重入不变量（放在模型层，新增入口不会漏掉）：
+    /// 落位动画进行中或手指仍在跟手时，`finishDragCommit` 还会按方向再提交一次，
+    /// 此时直接改页码会叠加成「跳两页」。
+    public var allowsPageNavigation: Bool {
+        PageSettleGuard.allowsNavigation(isSettlingPageDrag: isSettlingPageDrag, pageDragOffset: pageDragOffset)
+    }
+
+    /// 横滑翻页是否生效（分页浏览且不在搜索 / 文件夹态）。面板层事件过滤与
+    /// 横滑处理共用这一个判定。
+    public var isPagedBrowsingActive: Bool {
+        settings.browsingStyle == .paged && searchQuery.isEmpty && !isFolderViewActive
+    }
+
     public func goToPage(_ index: Int) {
+        guard allowsPageNavigation else { return }
         lastPageDirection = index >= currentPage ? .forward : .backward
         currentPage = min(max(index, 0), pageCount - 1)
         openedFolder = nil
     }
 
     public func nextPage() {
-        guard currentPage < pageCount - 1 else { return }
+        guard allowsPageNavigation, currentPage < pageCount - 1 else { return }
         lastPageDirection = .forward
         currentPage += 1
         openedFolder = nil
     }
 
     public func previousPage() {
-        guard currentPage > 0 else { return }
+        guard allowsPageNavigation, currentPage > 0 else { return }
         lastPageDirection = .backward
         currentPage -= 1
         openedFolder = nil
@@ -336,12 +356,35 @@ public final class LaunchpadModel {
 
     // MARK: - 搜索
 
+    /// 搜索命中缓存：键为 (查询, 是否含隐藏, 存储修订号)。
+    /// 视图与键盘路由在一次按键里会多次读取命中（结果网格、高亮下标、回车启动），
+    /// 每次都全量过滤 + 拼音 + 排序是 O(k·n log n)。
+    private struct SearchHitsCache {
+        let query: String
+        let includeHidden: Bool
+        let revision: Int
+        let hits: [SearchHit]
+    }
+    @ObservationIgnored private var searchHitsCache: SearchHitsCache?
+
     /// 搜索命中（隐藏应用默认排除）。
     /// 排序：应用名前缀 > 应用名包含 / bundleName 前缀 > bundleName 包含 / 拼音首字母 > 文件夹名命中。
     public var searchHits: [SearchHit] {
         let query = searchQuery.trimmingCharacters(in: .whitespaces)
         guard !query.isEmpty else { return [] }
+        // 先读 settings（即 store.state）登记观察依赖，缓存命中时视图也会随布局变化刷新
         let includeHidden = settings.showHiddenAppsInSearch
+        let revision = store.revision
+        if let cache = searchHitsCache, cache.query == query,
+           cache.includeHidden == includeHidden, cache.revision == revision {
+            return cache.hits
+        }
+        let hits = computeSearchHits(query: query, includeHidden: includeHidden)
+        searchHitsCache = SearchHitsCache(query: query, includeHidden: includeHidden, revision: revision, hits: hits)
+        return hits
+    }
+
+    private func computeSearchHits(query: String, includeHidden: Bool) -> [SearchHit] {
         let lowerQuery = query.lowercased()
         let compactQuery = lowerQuery.replacingOccurrences(of: " ", with: "")
 
@@ -453,9 +496,11 @@ public final class LaunchpadModel {
 
     /// 启动成功后的收尾：记录使用、按排序重排、收起面板。
     private func finishLaunch(appID: String) {
-        store.recordLaunch(appID: appID)
-        // 非「自定义」排序模式下保持网格与排序一致（如「最近使用」把刚启动的应用排到最前）
-        store.applyActiveSort()
+        store.batchUpdates {
+            store.recordLaunch(appID: appID)
+            // 非「自定义」排序模式下保持网格与排序一致（如「最近使用」把刚启动的应用排到最前）
+            store.applyActiveSort()
+        }
         // 收起必须经 onDismiss 走窗口控制器（真正执行 orderOut）；
         // 模型层 hide() 只复位 UI 状态不关窗口，会让面板残留全屏，
         // 且此后 Esc/空白点击等收起路径被 controller.hide() 的 guard 拦死。
@@ -547,9 +592,7 @@ public final class LaunchpadModel {
         if hidden, selectedAppIDs.contains(appID) {
             selectedAppIDs.remove(appID)
         }
-        if openedFolder != nil, openedFolderRecord == nil {
-            closeFolder()
-        }
+        reconcileOpenedFolder()
     }
 
     public func toggleHidden(appID: String) {
@@ -558,15 +601,17 @@ public final class LaunchpadModel {
 
     /// 取消隐藏：应用若未在网格上则追加到末页。
     public func unhide(appID: String) {
-        setHidden(false, appID: appID)
         let capacity = density.capacity  // 跟随当前密度，避免高密度下提前溢出新页
-        store.updateLayout { layout in
-            guard let app = layout.apps[appID], !app.isAlias else { return }
-            if !layout.placedAppIDs.contains(appID) {
-                layout.appendApp(id: appID, toPage: max(layout.pages.count - 1, 0), capacityPerPage: capacity)
+        store.batchUpdates {
+            setHidden(false, appID: appID)
+            store.updateLayout { layout in
+                guard let app = layout.apps[appID], !app.isAlias else { return }
+                if !layout.placedAppIDs.contains(appID) {
+                    layout.appendApp(id: appID, toPage: max(layout.pages.count - 1, 0), capacityPerPage: capacity)
+                }
             }
+            store.applyActiveSort()
         }
-        store.applyActiveSort()
     }
 
     public func rename(appID: String, to newName: String) {
@@ -601,8 +646,16 @@ public final class LaunchpadModel {
     /// 用户数据没了应用还在（评审 P1-8 / P2-11）。
     public func uninstallBlockReason(appID: String) -> String? {
         guard let app = layout.apps[appID] else { return "未找到应用" }
-        return UninstallEligibility.blockReason(for: app)
+        // 判定要解析符号链接、读卷属性、lstat，属于主线程同步文件 I/O；
+        // 右键菜单每次构建都会问一遍，按路径缓存（重扫后清空）。
+        if let cached = uninstallBlockReasonCache[app.path] { return cached }
+        let reason = UninstallEligibility.blockReason(for: app)
+        uninstallBlockReasonCache[app.path] = .some(reason)
+        return reason
     }
+
+    /// 卸载拦截原因缓存（key: 应用路径；值为 nil 表示可以卸载）。
+    @ObservationIgnored private var uninstallBlockReasonCache: [String: String?] = [:]
 
     /// 移到废纸篓（系统应用拦截；alias 只删替身）。UI 弹窗由调用方承担。
     public func moveToTrash(appID: String) async -> TrashOutcome {
@@ -685,6 +738,10 @@ public final class LaunchpadModel {
     /// 是否允许拖拽整理（仅 Custom 模式）。
     public var dragAllowed: Bool { activeSortKey == .custom }
 
+    private func showDragRequiresCustomSortToast() {
+        ToastManager.shared.show(.info, "拖拽整理仅支持「自定义」排序模式。")
+    }
+
     /// 多选拖拽载荷顺序：按源页视觉顺序（左→右、上→下）排列；
     /// 不在本页的选中项（理论上不应出现）按字母序追加，避免拖拽块内部顺序反转。
     public func orderedSelection(onPage page: Int) -> [String] {
@@ -700,7 +757,7 @@ public final class LaunchpadModel {
     /// 执行拖放。`sourceFolderID` 为拖拽源所在文件夹（从文件夹内拖出时提供）。
     public func performDrop(draggingIDs: [String], sourceFolderID: UUID?, target: DropTarget) {
         guard dragAllowed else {
-            ToastManager.shared.show(.info, "拖拽整理仅支持「自定义」排序模式。")
+            showDragRequiresCustomSortToast()
             return
         }
         let movableIDs = draggingIDs.filter { id in
@@ -715,10 +772,7 @@ public final class LaunchpadModel {
 
         let capacity = density.capacity  // 先取值：闭包内再读 store.state 会触发独占访问冲突
         store.updateLayout { layout in
-            // resetLayout 等路径可能让布局没有任何页面：先补一页，避免后续 pages[-1] 崩溃
-            if layout.pages.isEmpty {
-                layout.pages = [PageRecord()]
-            }
+            layout.ensureHasPage()
 
             // 1. 从原位置移除（直接摆放或文件夹内）。
             //    防御：拖拽载荷可能没有来源文件夹信息（例如历史版本的文件夹整体拖拽、
@@ -767,6 +821,15 @@ public final class LaunchpadModel {
                 FolderEngine.mergeIntoFolder(appIDs: movableIDs, folderID: folderID, layout: &layout)
             }
 
+            // 3. 兜底：目标在放置前已失效（异步载荷回调到来前被重扫移除等）时引擎直接返回，
+            //    第 1 步已摘除的拖拽项必须放回网格——否则留在注册表里却不在任何页上，
+            //    merge 也不会补摆（它只追加注册表里没有的应用）。
+            let fallbackPage = min(max(target.page, 0), layout.pages.count - 1)
+            for appID in movableIDs
+            where layout.pageIndexOfDirectApp(appID) == nil && layout.folderLocation(of: appID) == nil {
+                _ = layout.appendApp(id: appID, toPage: fallbackPage, capacityPerPage: capacity)
+            }
+
             layout.removeEmptyPages()
         }
         // 拖放收尾：只保留「仍直接摆放在网格上」的选择项。
@@ -774,9 +837,7 @@ public final class LaunchpadModel {
         // 会把已在文件夹里的应用再收进第二个文件夹（同一应用出现两次）。
         selectedAppIDs = selectedAppIDs.filter { layout.pageIndexOfDirectApp($0) != nil }
         // 打开态文件夹可能因这次拖放被摘空删除：面板必须一并关闭，否则只剩空白蒙层。
-        if openedFolder != nil, openedFolderRecord == nil {
-            closeFolder()
-        }
+        reconcileOpenedFolder()
         currentPage = min(max(currentPage, 0), pageCount - 1)
     }
 
@@ -814,7 +875,7 @@ public final class LaunchpadModel {
     /// 文件夹内重排：把拖拽项移到目标项之前。
     public func moveWithinFolder(draggingIDs: [String], folderID: UUID, beforeAppID: String) {
         guard dragAllowed else {
-            ToastManager.shared.show(.info, "拖拽整理仅支持「自定义」排序模式。")
+            showDragRequiresCustomSortToast()
             return
         }
         store.updateLayout { layout in
@@ -880,10 +941,7 @@ public final class LaunchpadModel {
     public func createNewFolderOnCurrentPage() {
         var created = false
         store.updateLayout { layout in
-            // resetLayout 后布局可能没有任何页面：补一页，避免 pages[-1] 崩溃
-            if layout.pages.isEmpty {
-                layout.pages = [PageRecord()]
-            }
+            layout.ensureHasPage()
             // 建文件夹：把当前页最后 1 个应用收进去（Launchpad 语义）。
             // 无应用时不建空文件夹占位——布局不变量「空文件夹不允许存在」，
             // 空夹没有任何交互入口（点开是空白、拖出成员即删除），只会困扰用户。
@@ -950,9 +1008,7 @@ public final class LaunchpadModel {
         }
         ToastManager.shared.show(.info, "已隐藏 \(ids.count) 个应用")
         clearSelection()
-        if openedFolder != nil, openedFolderRecord == nil {
-            closeFolder()
-        }
+        reconcileOpenedFolder()
     }
 
     /// 批量把选择合并进新文件夹。
@@ -968,14 +1024,11 @@ public final class LaunchpadModel {
             return
         }
         guard dragAllowed else {
-            ToastManager.shared.show(.info, "拖拽整理仅支持「自定义」排序模式。")
+            showDragRequiresCustomSortToast()
             return
         }
         store.updateLayout { layout in
-            // resetLayout 后布局可能没有任何页面：补一页并钳位，避免 pages[-1] 崩溃
-            if layout.pages.isEmpty {
-                layout.pages = [PageRecord()]
-            }
+            layout.ensureHasPage()
             let page = self.selectionAnchorPage(ids: ids, layout: layout)
             FolderEngine.mergeIntoNewFolder(appIDs: ids, page: page, layout: &layout)
         }
@@ -1025,8 +1078,23 @@ public final class LaunchpadModel {
     /// 上一次「来源目录读不到」提示对应的目录集合（集合变化时才再提示，避免重扫刷屏）。
     @ObservationIgnored private var lastUnreadableDirectoriesNotice: Set<String> = []
 
+    /// 「未完成 bundle」补扫状态（见 `IncompleteBundleRetry`）。
+    @ObservationIgnored private var incompleteRetry = IncompleteBundleRetry()
+    @ObservationIgnored private var incompleteRetryWork: DispatchWorkItem?
+
+    /// 扫描串行化：同一时刻只跑一次扫描，进行中的请求合并成结束后的一次补扫。
+    /// 并发扫描会让两次合并看到同一个文件系统快照（如 Finder 替换安装的缺口），
+    /// 「连续两次缺失才移除」的宽限一次就被耗尽，用户排列被删。
+    @ObservationIgnored private var scanInFlight = false
+    @ObservationIgnored private var rescanRequestedDuringScan = false
+
     public func rescan() {
         isScanning = true
+        guard !scanInFlight else {
+            rescanRequestedDuringScan = true
+            return
+        }
+        scanInFlight = true
         let sources = store.state.sources
         let capacity = density.capacity
         Task.detached(priority: .userInitiated) { [weak self] in
@@ -1037,17 +1105,26 @@ public final class LaunchpadModel {
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 let unreadable = diagnostics.failedDirectories.map(\.path)
-                self.store.updateLayout { layout in
-                    _ = SyncEngine.merge(
-                        scanned: diagnostics.records,
-                        into: &layout,
-                        capacityPerPage: capacity,
-                        unreadablePrefixes: unreadable
-                    )
-                    // 保留既有使用统计与 NEW 状态：merge 刷新元数据已保留；
-                    // 这里恢复 addedAt（merge 不覆盖在册 addedAt，无需处理）
+                let incomplete = diagnostics.incompleteBundles.map(\.path)
+                self.uninstallBlockReasonCache.removeAll()
+                // 合并 + 排序合成一次落盘
+                self.store.batchUpdates {
+                    self.store.updateLayout { layout in
+                        _ = SyncEngine.merge(
+                            scanned: diagnostics.records,
+                            into: &layout,
+                            capacityPerPage: capacity,
+                            // 覆盖更新中的 bundle（Info.plist 暂缺）同样只是「暂时读不到」，不累计缺失。
+                            // 补扫用尽也继续保护：bundle 目录仍在磁盘上，删掉排列不可恢复，
+                            // 而保留一个打不开的格子用户可以自行处理
+                            unreadablePrefixes: unreadable + incomplete
+                        )
+                        // 保留既有使用统计与 NEW 状态：merge 刷新元数据已保留；
+                        // 这里恢复 addedAt（merge 不覆盖在册 addedAt，无需处理）
+                    }
+                    // 非「自定义」排序模式下，扫描结果（含站外启动刷新的最近使用时间）落位后全局重排
+                    self.store.applyActiveSort()
                 }
-                self.isScanning = false
                 self.icons.invalidateCache()
                 // 后台预热整仓图标：网格渲染（首展 / 滚动跨页）全部命中缓存，
                 // 不再在主线程做突发性的同步重采样
@@ -1055,13 +1132,59 @@ public final class LaunchpadModel {
                     paths: diagnostics.records.map(\.path),
                     mode: self.settings.iconColorMode
                 )
-                // 非「自定义」排序模式下，扫描结果（含站外启动刷新的最近使用时间）落位后全局重排
-                self.store.applyActiveSort()
                 self.pruneSelection()
                 self.reconcileOpenedFolder()
                 self.notifyUnreadableDirectories(unreadable)
+                self.scheduleIncompleteBundleRetry(incomplete)
+                self.scanInFlight = false
+                if self.rescanRequestedDuringScan {
+                    self.rescanRequestedDuringScan = false
+                    self.rescan()
+                } else {
+                    self.isScanning = false
+                }
             }
         }
+    }
+
+    /// 扫描结果里仍有未完成 bundle 时按退避间隔安排轻量探测（见 `IncompleteBundleRetry`）。
+    private func scheduleIncompleteBundleRetry(_ paths: [String]) {
+        switch incompleteRetry.scanCompleted(incomplete: Set(paths)) {
+        case .cancel:
+            incompleteRetryWork?.cancel()
+            incompleteRetryWork = nil
+        case .keep:
+            // 同一批未完成 bundle：已有探测在排队就沿用，不让无关重扫消耗重试次数
+            if incompleteRetryWork == nil { armIncompleteBundleProbe(after: incompleteRetry.currentDelay) }
+        case .arm(let delay):
+            armIncompleteBundleProbe(after: delay)
+        }
+    }
+
+    private func armIncompleteBundleProbe(after delay: TimeInterval) {
+        incompleteRetryWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated { self?.probeIncompleteBundles() }
+        }
+        incompleteRetryWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    /// 只读待定 bundle 的 Info.plist：有变化（已可读 / bundle 已消失）才做整仓重扫，
+    /// 否则推进退避——避免损坏 bundle 让整仓重扫（清图标缓存、重排、扫描态闪烁）反复空转。
+    private func probeIncompleteBundles() {
+        incompleteRetryWork = nil
+        let fileManager = FileManager.default
+        let changed = incompleteRetry.pending.contains { path in
+            !fileManager.fileExists(atPath: path)
+                || AppIndex.readInfoPlist(bundleAt: URL(fileURLWithPath: path), fileManager: fileManager) != nil
+        }
+        if changed {
+            rescan()
+        } else if let delay = incompleteRetry.probeFailed() {
+            armIncompleteBundleProbe(after: delay)
+        }
+        // 用尽：只停止探测（保护仍在，见 rescan），不再空跑整仓重扫
     }
 
     /// 清掉已不在注册表里的选择项（卸载 / 重扫移除后调用）。
@@ -1092,5 +1215,55 @@ public final class LaunchpadModel {
             .info,
             "有 \(current.count) 个应用来源目录暂时无法读取，已保留其中应用的排列（请检查外置磁盘是否已挂载、文件访问权限）"
         )
+    }
+}
+
+// MARK: - 未完成 bundle 补扫
+
+/// 「未完成 bundle」补扫状态机：拖拽 / cp 安装时 .app 目录先出现、Info.plist 后写入，
+/// 而 bundle 内部的写入不会触发来源目录的监听事件——不补扫的话新应用要等到下一次
+/// 无关的目录变化才出现。按退避间隔探测，直到不再有未完成 bundle 或用尽次数；
+/// 用尽的路径记为「已放弃」：不再探测（合并时仍当作暂时读不到，避免大应用的长时间
+/// 覆盖更新丢失排列），直到它某次扫描恢复正常后才清出该集合。
+struct IncompleteBundleRetry {
+    static let delays: [TimeInterval] = [1.5, 2, 3, 5, 5, 10, 10, 15, 15, 30, 30, 60]
+
+    enum Action: Equatable {
+        case cancel
+        case keep
+        case arm(TimeInterval)
+    }
+
+    /// 正在等待补扫的未完成 bundle。
+    private(set) var pending: Set<String> = []
+    /// 补扫用尽仍未完成的 bundle。
+    private(set) var exhausted: Set<String> = []
+    private(set) var attempt = 0
+
+    var currentDelay: TimeInterval { Self.delays[min(attempt, Self.delays.count - 1)] }
+
+    /// 一次扫描完成：更新待定集合，返回对探测定时器的处理。
+    mutating func scanCompleted(incomplete: Set<String>) -> Action {
+        exhausted.formIntersection(incomplete)
+        let newPending = incomplete.subtracting(exhausted)
+        guard !newPending.isEmpty else {
+            pending = []
+            attempt = 0
+            return .cancel
+        }
+        guard newPending != pending else { return .keep }
+        pending = newPending
+        attempt = 0
+        return .arm(Self.delays[0])
+    }
+
+    /// 一次探测没发现变化：返回下一次探测的延迟；nil 表示用尽（待定集合转入已放弃）。
+    mutating func probeFailed() -> TimeInterval? {
+        attempt += 1
+        if attempt < Self.delays.count { return Self.delays[attempt] }
+        exhausted.formUnion(pending)
+        pending = []
+        attempt = 0
+        return nil
     }
 }
